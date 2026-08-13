@@ -140,7 +140,9 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
         BOOL refresh = [path isEqualToString:@"/friends/refresh"];
         BOOL started = YES;
         NSString *handle = q[@"handle"];
-        NSString *json = refresh ? [[LSSDaemonController shared] refreshFriendsJSONForHandle:handle ifStarted:&started] : [[LSSDaemonController shared] friendsJSON];
+        NSString *json = refresh ?
+            [[LSSDaemonController shared] refreshFriendsJSONForHandle:handle ifStarted:&started] :
+            [[LSSDaemonController shared] friendsJSONForHandle:handle];
         WriteJSONBody(cfd, started ? 200 : 409, started ? "OK" : "Conflict", json);
         close(cfd);
         return;

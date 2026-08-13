@@ -5,14 +5,14 @@
 #import <CoreLocation/CoreLocation.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
-#include <spawn.h>
 #include <math.h>
-#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <string.h>
 
-extern char **environ;
-
-static NSString *const kFMFHelperPath = @"/usr/libexec/fmfhelper";
+static const int kFMFWatchPort = 8766;
 
 // Random per-device token, persisted so it survives daemon restarts (otherwise
 // the external pusher's saved token would break on every relaunch). Not in git.
@@ -114,9 +114,64 @@ static NSDictionary *ReadBatteryStatus(void) {
     return battery ?: @{@"ok": @NO, @"message": @"battery not found"};
 }
 
+static NSString *URLEncode(NSString *s) {
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
+        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-"];
+    return [s stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: @"";
+}
+
+static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOut) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (statusOut) *statusOut = 0;
+        return @"{\"ok\":false,\"message\":\"fmfwatchd socket failed\"}";
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)kFMFWatchPort);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        if (statusOut) *statusOut = 0;
+        return @"{\"ok\":false,\"message\":\"fmfwatchd unavailable\"}";
+    }
+
+    NSString *target = path;
+    if (handle.length) {
+        target = [target stringByAppendingFormat:@"?handle=%@", URLEncode(handle)];
+    }
+    NSString *req = [NSString stringWithFormat:
+        @"GET %@ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", target];
+    NSData *reqData = [req dataUsingEncoding:NSUTF8StringEncoding];
+    (void)write(fd, reqData.bytes, reqData.length);
+
+    NSMutableData *resp = [NSMutableData data];
+    uint8_t buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) [resp appendBytes:buf length:(size_t)n];
+    close(fd);
+
+    NSString *raw = [[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding];
+    if (!raw.length) {
+        if (statusOut) *statusOut = 0;
+        return @"{\"ok\":false,\"message\":\"fmfwatchd empty response\"}";
+    }
+
+    NSArray<NSString *> *lines = [raw componentsSeparatedByString:@"\r\n"];
+    int status = 0;
+    if (lines.count > 0) sscanf(lines[0].UTF8String, "HTTP/%*s %d", &status);
+    if (statusOut) *statusOut = status;
+
+    NSRange sep = [raw rangeOfString:@"\r\n\r\n"];
+    if (sep.location == NSNotFound) return @"{\"ok\":false,\"message\":\"fmfwatchd bad response\"}";
+    return [raw substringFromIndex:sep.location + sep.length];
+}
+
 @interface LSSDaemonController ()
 @property(nonatomic, strong) LSSLocalHTTPServer *publicServer;
-@property(nonatomic, assign) BOOL refreshFriendsInProgress;
 @end
 
 @implementation LSSDaemonController
@@ -186,92 +241,24 @@ static NSDictionary *ReadBatteryStatus(void) {
     return [self applyToken:GenerateToken()];
 }
 
-// Spawn the FMF helper and return its JSON stdout. Blocks until it exits
-// (helper self-caps), so callers must not run on a shared serial path.
-- (NSString *)friendsJSONWithRefresh:(BOOL)refresh handle:(NSString *)handle {
-    int fds[2];
-    if (pipe(fds) != 0) {
-        if (refresh) [[LSSLogger shared] log:@"friends refresh failed before spawn: pipe failed" tag:@"FMF"];
-        return @"{\"ok\":false,\"message\":\"pipe failed\"}";
-    }
-
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&fa, fds[0]);
-    posix_spawn_file_actions_addclose(&fa, fds[1]);
-
-    char *argv[] = {
-        (char *)kFMFHelperPath.UTF8String,
-        refresh ? "--refresh" : NULL,
-        (refresh && handle.length) ? (char *)handle.UTF8String : NULL,
-        NULL
-    };
-    pid_t pid = 0;
-    int rc = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    close(fds[1]);
-
-    if (rc != 0) {
-        close(fds[0]);
-        [[LSSLogger shared] log:[NSString stringWithFormat:@"fmfhelper spawn failed rc=%d", rc] tag:@"FMF"];
-        return @"{\"ok\":false,\"message\":\"helper spawn failed\"}";
-    }
-
-    if (refresh) {
-        NSString *target = handle.length ? [NSString stringWithFormat:@" handle=%@", handle] : @"";
-        [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh helper started pid=%d%@", pid, target] tag:@"FMF"];
-    }
-
-    NSMutableData *out = [NSMutableData data];
-    uint8_t buf[4096];
-    ssize_t n;
-    while ((n = read(fds[0], buf, sizeof(buf))) > 0) [out appendBytes:buf length:(size_t)n];
-    close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    if (refresh && status != 0) {
-        [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh helper exited status=%d", status] tag:@"FMF"];
-    }
-
-    if (out.length == 0) {
-        if (refresh) [[LSSLogger shared] log:@"friends refresh failed: helper produced no output" tag:@"FMF"];
-        return @"{\"ok\":false,\"message\":\"helper produced no output\"}";
-    }
-    NSString *s = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding];
-    if (!s && refresh) [[LSSLogger shared] log:@"friends refresh failed: helper output not utf8" tag:@"FMF"];
-    return s ?: @"{\"ok\":false,\"message\":\"helper output not utf8\"}";
+- (NSString *)friendsJSON {
+    return FMFWatchRequest(@"/friends", nil, NULL);
 }
 
-- (NSString *)friendsJSON {
-    return [self friendsJSONWithRefresh:NO handle:nil];
+- (NSString *)friendsJSONForHandle:(NSString *)handle {
+    return FMFWatchRequest(@"/friends", handle, NULL);
 }
 
 - (NSString *)refreshFriendsJSONForHandle:(NSString *)handle ifStarted:(BOOL *)started {
-    @synchronized (self) {
-        if (self.refreshFriendsInProgress) {
-            if (started) *started = NO;
-            [[LSSLogger shared] log:@"friends refresh rejected: already in progress" tag:@"FMF"];
-            return @"{\"ok\":false,\"message\":\"friends refresh already in progress\"}";
-        }
-        self.refreshFriendsInProgress = YES;
-    }
-
-    if (started) *started = YES;
     NSDate *start = [NSDate date];
     NSString *target = handle.length ? [NSString stringWithFormat:@" for handle=%@", handle] : @"";
     [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh started%@", target] tag:@"FMF"];
-    @try {
-        NSString *json = [self friendsJSONWithRefresh:YES handle:handle];
-        NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:start];
-        [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh finished in %.1fs (%@)", elapsed, FriendsSummary(json)] tag:@"FMF"];
-        return json;
-    } @finally {
-        @synchronized (self) {
-            self.refreshFriendsInProgress = NO;
-        }
-    }
+    int status = 0;
+    NSString *json = FMFWatchRequest(@"/refresh", handle, &status);
+    if (started) *started = (status != 409);
+    NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:start];
+    [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh finished in %.1fs (%@)", elapsed, FriendsSummary(json)] tag:@"FMF"];
+    return json;
 }
 
 - (NSDictionary *)batteryStatus {

@@ -167,7 +167,9 @@ static NSData *ReadExact(int fd, size_t n) {
         NSDictionary *q = ParseQuery(query);
         BOOL refresh = [path isEqualToString:@"/friends/refresh"];
         BOOL started = YES;
-        NSString *json = refresh ? [dc refreshFriendsJSONForHandle:q[@"handle"] ifStarted:&started] : [dc friendsJSON];
+        NSString *json = refresh ?
+            [dc refreshFriendsJSONForHandle:q[@"handle"] ifStarted:&started] :
+            [dc friendsJSONForHandle:q[@"handle"]];
         WriteJSONBody(cfd, started ? 200 : 409, json);
         close(cfd);
         return;
