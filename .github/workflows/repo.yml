@@ -1,0 +1,130 @@
+# Builds the .deb and publishes this GitHub repo as a Sileo/APT source on Pages.
+# Downloads are pinned by release tag and come from the same places a local
+# install-theos uses. Only GitHub's own Actions are used. Bump pins by hand.
+name: Build and publish repo
+
+on:
+  push:
+    tags: ['v*']       # must match Version: in control
+  workflow_dispatch:   # manual run -> 0.1.0+ci<n>, for testing
+
+permissions:
+  contents: read
+  pages: write         # deploy-pages needs these two
+  id-token: write
+
+# A half-written repo index is worse than a late one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  SDK: iPhoneOS16.5.sdk
+  SDKS_RELEASE: master-146e41f              # github.com/theos/sdks/releases
+  TOOLCHAIN_RELEASE: test-210562a           # github.com/L1ghtmann/llvm-project/releases
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Only for base_url, which index.html prints.
+      - uses: actions/configure-pages@v6
+        id: pages
+
+      # dpkg-dev for dpkg-scanpackages; fakeroot and rsync are what Theos
+      # shells out to when staging the package.
+      - name: Install build tools
+        run: sudo apt update && sudo apt install -y --no-install-recommends dpkg-dev fakeroot rsync
+
+      # --recursive: submodules carry dm.pl, the .deb writer. Cloned before the
+      # cache restore, because git clone needs the directory to be empty.
+      - name: Clone Theos
+        run: git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+
+      - name: Restore toolchain, SDK and Go module caches
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            theos/toolchain
+            theos/sdks
+            ~/go/pkg/mod
+          key: theos-${{ env.TOOLCHAIN_RELEASE }}-${{ env.SDKS_RELEASE }}-${{ env.SDK }}-${{ hashFiles('Makefile') }}
+
+      - name: Fetch iOS toolchain and SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
+          # clang/ld that run on Linux and emit Mach-O for arm64.
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/$TOOLCHAIN_RELEASE/iOSToolchain-x86_64.tar.xz" \
+            | tar -xJf - -C "$THEOS/toolchain"
+          # TARGET in the Makefile picks the newest SDK present, so keeping
+          # exactly one here is what makes the build deterministic.
+          curl -fsSL "https://github.com/theos/sdks/releases/download/$SDKS_RELEASE/$SDK.tar.xz" \
+            | tar -xJf - -C "$THEOS/sdks"
+
+      # control is the one place the version lives; a tag only says "ship it",
+      # and disagreeing with control fails here rather than in someone's Sileo.
+      - name: Decide package version
+        id: ver
+        run: |
+          set -euo pipefail
+          base=$(grep -i '^Version:' control | cut -d' ' -f2- | tr -d '[:space:]')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag=${GITHUB_REF#refs/tags/v}
+            if [[ "$tag" != "$base" ]]; then
+              echo "::error::tag v$tag does not match Version: $base in control. Bump control first."
+              exit 1
+            fi
+            echo "version=$base" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${base}+ci${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # PACKAGE_VERSION suppresses Theos's build counter, which resets to 1 on a
+      # fresh checkout and would hand Sileo a version that goes backwards.
+      - name: Build package
+        run: make package FINALPACKAGE=1 PACKAGE_VERSION=${{ steps.ver.outputs.version }}
+
+      # An APT repo is just the .deb, a Packages index describing it, and a
+      # Release naming the source.
+      - name: Build APT repo
+        run: |
+          set -euo pipefail
+          mkdir -p _site/debs
+          cp packages/*.deb _site/debs/
+          cd _site
+          dpkg-scanpackages -m debs /dev/null > Packages
+          gzip -9kf Packages
+          # ponytail: no hashes in Release, no GPG signature. Sileo and Zebra
+          # check neither over HTTPS; add both if apt(8) ever needs to trust it.
+          # Suite/Codename/Components are left out on purpose: they address one
+          # dist inside a multi-dist archive, and this repo is flat (deb URL ./).
+          cat > Release <<EOF
+          Origin: jjoelj
+          Label: jjoelj
+          Architectures: iphoneos-arm
+          Description: Tweaks and tools by jjoelj
+          EOF
+          cat > index.html <<EOF
+          <title>jjoelj's repo</title>
+          <h1>jjoelj's repo</h1>
+          <p>Currently hosting: LocationSpoofServer.</p>
+          <p>Add this URL as a source in Sileo:</p>
+          <pre>${{ steps.pages.outputs.base_url }}</pre>
+          <p><a href="https://github.com/${{ github.repository }}">Source on GitHub</a></p>
+          EOF
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - uses: actions/deploy-pages@v5
+        id: deploy
