@@ -142,7 +142,7 @@ any other package. `.github/workflows/repo.yml` does it in one job:
 
 One-time setup: **Settings → Pages → Source: GitHub Actions**. Without it the
 deploy step fails. Manual runs (**Actions → Run workflow**) publish a
-`0.1.0+ci<n>` build for testing, which sorts below any real tag.
+`0.1.0~ci<n>` build for testing; `~` sorts below the plain version, so the real tag supersedes it.
 
 The published repo carries no GPG signature and no hashes in `Release`. Sileo
 and Zebra do not check either over HTTPS; `apt` on a desktop would complain.

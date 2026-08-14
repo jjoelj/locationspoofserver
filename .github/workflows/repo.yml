@@ -6,7 +6,7 @@ name: Build and publish repo
 on:
   push:
     tags: ['v*']       # must match Version: in control
-  workflow_dispatch:   # manual run -> 0.1.0+ci<n>, for testing
+  workflow_dispatch:   # manual run -> 0.1.0~ci<n>; ~ sorts below the release
 
 permissions:
   contents: read
@@ -85,7 +85,7 @@ jobs:
             fi
             echo "version=$base" >> "$GITHUB_OUTPUT"
           else
-            echo "version=${base}+ci${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "version=${base}~ci${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           fi
 
       # PACKAGE_VERSION suppresses Theos's build counter, which resets to 1 on a
