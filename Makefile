@@ -73,7 +73,10 @@ TS_SOCK = /var/run/lss-tailscaled.socket
 TS_CLI = /usr/local/bin/tailscale --socket=$(TS_SOCK)
 LDID ?= $(THEOS)/toolchain/linux/iphone/bin/ldid
 
-before-package:: $(TS_BIN)/tailscaled $(TS_BIN)/tailscale
+# before-stage, not before-package: staging copies layout/ into the package
+# tree, and it runs first. Built here, the binaries would land in layout/ after
+# the copy and ship in the *next* build instead of this one.
+before-stage:: $(TS_BIN)/tailscaled $(TS_BIN)/tailscale
 
 $(TS_BIN)/%:
 	@command -v go >/dev/null || { echo "error: go not on PATH, needed to build $*"; exit 1; }
