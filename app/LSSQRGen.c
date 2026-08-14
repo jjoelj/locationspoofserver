@@ -37,12 +37,14 @@ static void rs_remainder(const uint8_t *data, int dataLen, const uint8_t *diviso
     }
 }
 
-// ---- ECC level M, versions 1-3: {data codewords, ecc codewords} ----
-static const int DATA_CW[4] = {0, 16, 28, 44};
-static const int ECC_CW[4]  = {0, 10, 16, 26};
+// ---- ECC level L, versions 1-5: {data codewords, ecc codewords} ----
+// L rather than M: the payload is a URL plus token (~70 bytes) and M tops out
+// at 62 before needing multi-block interleaving. Fine for a code on a screen.
+static const int DATA_CW[6] = {0, 19, 34, 55, 80, 108};
+static const int ECC_CW[6]  = {0,  7, 10, 15, 20,  26};
 
-// N x N working buffers (max v3 = 29).
-#define MAXN 29
+// N x N working buffers (max v5 = 37).
+#define MAXN 37
 static uint8_t g_fn[MAXN * MAXN]; // 1 = function/reserved module (not maskable)
 
 static void set_module(uint8_t *m, int N, int r, int c, int v, int isFn) {
@@ -88,7 +90,9 @@ static void draw_function_patterns(uint8_t *m, int N, int version) {
     draw_finder(m, N, 0, 0);
     draw_finder(m, N, 0, N - 7);
     draw_finder(m, N, N - 7, 0);
-    if (version >= 2) { int c = (version == 2) ? 18 : 22; draw_alignment(m, N, c, c); }
+    // v2-6 have exactly one alignment pattern, at (N-7, N-7); the other three
+    // candidate centers collide with the finders and are omitted.
+    if (version >= 2) draw_alignment(m, N, N - 7, N - 7);
     reserve_format(m, N);
 }
 
@@ -187,16 +191,18 @@ static int penalty(const uint8_t *m, int N) {
 }
 
 static void set_format(uint8_t *m, int N, int mask) {
-    int data = (0 << 3) | mask; // ECC level M = 0b00
+    int data = (1 << 3) | mask; // ECC level L = 0b01
     int rem = data;
     for (int i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
     int bits = ((data << 10) | rem) ^ 0x5412;
-    // top-left + split
-    for (int i = 0; i <= 5; i++) set_module(m, N, 8, i, (bits >> i) & 1, 1);
-    set_module(m, N, 8, 7, (bits >> 6) & 1, 1);
+    // Top-left copy: bits 0-8 run down column 8, bits 9-14 left along row 8.
+    // Easy to transpose by mistake, and scanners that fall back to the second
+    // copy below will hide it from you.
+    for (int i = 0; i <= 5; i++) set_module(m, N, i, 8, (bits >> i) & 1, 1);
+    set_module(m, N, 7, 8, (bits >> 6) & 1, 1);
     set_module(m, N, 8, 8, (bits >> 7) & 1, 1);
-    set_module(m, N, 7, 8, (bits >> 8) & 1, 1);
-    for (int i = 9; i < 15; i++) set_module(m, N, 14 - i, 8, (bits >> i) & 1, 1);
+    set_module(m, N, 8, 7, (bits >> 8) & 1, 1);
+    for (int i = 9; i < 15; i++) set_module(m, N, 8, 14 - i, (bits >> i) & 1, 1);
     // top-right + bottom-left
     for (int i = 0; i < 8; i++) set_module(m, N, 8, N - 1 - i, (bits >> i) & 1, 1);
     for (int i = 8; i < 15; i++) set_module(m, N, N - 15 + i, 8, (bits >> i) & 1, 1);
@@ -206,9 +212,9 @@ static void set_format(uint8_t *m, int N, int mask) {
 int lss_qr_encode(const uint8_t *data, int len, uint8_t *modules) {
     gf_init();
 
-    // pick smallest version 1-3 that fits (byte mode: 4 + 8 + 8*len + 4 <= dataCW*8)
+    // pick smallest version 1-5 that fits (byte mode: 4 + 8 + 8*len + 4 <= dataCW*8)
     int version = 0;
-    for (int v = 1; v <= 3; v++) {
+    for (int v = 1; v <= 5; v++) {
         int cap = DATA_CW[v] * 8;
         if (4 + 8 + 8 * len + 4 <= cap) { version = v; break; }
     }
@@ -218,7 +224,7 @@ int lss_qr_encode(const uint8_t *data, int len, uint8_t *modules) {
     int dataCW = DATA_CW[version], eccCW = ECC_CW[version];
 
     // build data codewords
-    uint8_t cw[44]; memset(cw, 0, sizeof(cw));
+    uint8_t cw[108]; memset(cw, 0, sizeof(cw));
     // bit-pack: mode(0100), count(8), bytes(8 each), terminator
     int bitpos = 0;
     #define PUT(val, n) do { for (int _i = n - 1; _i >= 0; _i--) { if ((val >> _i) & 1) cw[bitpos >> 3] |= (uint8_t)(0x80 >> (bitpos & 7)); bitpos++; } } while (0)
@@ -236,7 +242,7 @@ int lss_qr_encode(const uint8_t *data, int len, uint8_t *modules) {
     rs_remainder(cw, dataCW, divisor, eccCW, ecc);
 
     // full bitstream = data codewords ++ ecc codewords (single block)
-    uint8_t bits[(44 + 26) * 8]; int nbits = 0;
+    uint8_t bits[(108 + 26) * 8]; int nbits = 0;
     for (int i = 0; i < dataCW; i++) for (int b = 7; b >= 0; b--) bits[nbits++] = (cw[i] >> b) & 1;
     for (int i = 0; i < eccCW; i++) for (int b = 7; b >= 0; b--) bits[nbits++] = (ecc[i] >> b) & 1;
 
@@ -263,8 +269,8 @@ int lss_qr_encode(const uint8_t *data, int len, uint8_t *modules) {
 
 #ifdef QR_TEST
 // Self-check: build with -DQR_TEST, prints "N\n" then the matrix as 0/1 rows.
-// Verified byte-exact ECC vs a reference RS impl and decoded with zxing across
-// lengths 1..42, version boundaries, and UTF-8; 43+ returns 0 (too long).
+// Output was verified module-for-module against the `qrcode` Python package
+// across version boundaries and UTF-8; 107+ returns 0 (too long).
 #include <stdio.h>
 int main(int argc, char **argv) {
     const char *s = argc > 1 ? argv[1] : "0123456789abcdef0123456789abcdef";
