@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Only on a real removal. dpkg calls this with "upgrade" mid-upgrade too, and
+# logging the node out then would cost you the tailnet identity on every update.
+[ "$1" = "remove" ] || exit 0
+
+TS="/usr/local/bin/tailscale --socket=/var/run/lss-tailscaled.socket"
+
+# Done here rather than in postrm: by then this binary is already deleted.
+# Drops the node from your tailnet, so nothing is left registered there.
+echo "Logging out of Tailscale..."
+$TS logout 2>/dev/null || true
+
+for d in locationspoofd fmfwatchd tailscaled; do
+	launchctl unload /Library/LaunchDaemons/io.github.jjoelj.$d.plist 2>/dev/null || true
+done
+
+exit 0

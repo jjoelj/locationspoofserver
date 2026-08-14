@@ -6,4 +6,4 @@ Description: HTTP server that sets the device's simulated location, and reports 
 Maintainer: Joel Jothiprakasam
 Author: Joel Jothiprakasam
 Section: Utilities
-Homepage: https://github.com/jjoelj/LocationSpoofServer
+Homepage: https://github.com/jjoelj/locationspoofserver

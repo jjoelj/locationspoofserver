@@ -15,14 +15,15 @@ The API below is plain HTTP, though, so anything that can make a request works.
 
 - A jailbroken iPhone. Developed against iOS 14.3 on a Taurine/libhooker
   device; the Tailscale workarounds below are specific to that vintage.
-- Root SSH to the phone from your build machine, with key auth set up —
-  `ssh root@<phone>` must work without a password prompt.
+- Root SSH to the phone, with key auth set up, if you build from source or want
+  the optional SSH-over-tailnet setup — `ssh root@<phone>` with no password.
 - A [Tailscale](https://tailscale.com) account. Free tier is plenty; this is
   one node. The account is yours, and no traffic passes through anything the
   project controls. Without it the daemons still run and the server still works
   on-device, but nothing outside the phone can reach it.
-- [theos](https://theos.dev) with an iOS SDK and `$THEOS` set, plus Go 1.24+ on
-  `PATH` for the Tailscale cross-build.
+- A package manager on the phone (Sileo, Zebra, Cydia — whatever your
+  jailbreak shipped). Building from source instead additionally needs
+  [theos](https://theos.dev) with an iOS SDK and Go 1.24+, as described below.
 
 ## What gets installed
 
@@ -46,15 +47,29 @@ tailscale --socket=/var/run/lss-tailscaled.socket status
 
 ### 1. Install
 
+Add this source in your package manager, then install
+**Location Spoof Server**:
+
+```
+https://jjoelj.github.io/locationspoofserver/
+```
+
+The daemons start with the package, so there is nothing to load by hand.
+
+<details>
+<summary>Or build it yourself</summary>
+
+Needs [theos](https://theos.dev) with an iOS SDK and `$THEOS` set, plus Go 1.24+
+on `PATH` for the Tailscale cross-build.
+
 ```sh
 THEOS_DEVICE_IP=iphone make package install
 ```
 
 Substitute your phone's hostname or IP. That cross-compiles Tailscale, builds
-the app and daemons, and installs the `.deb`. The daemons are loaded by the
-package's `postinst`, so a Sileo install starts them the same way.
+the app and daemons, and installs the `.deb` over SSH.
 
-Or install from the Sileo source instead — see [Releases](#releases) below.
+</details>
 
 ### 2. Log into Tailscale
 
@@ -66,8 +81,9 @@ turned on for you at that point.
 The same button becomes **Log out of Tailscale** once connected, which drops the
 node from your tailnet and takes the public URL down until you log in again.
 
-Tailscale's state lives in `/var/lib/tailscale` and survives reboots and later
-reinstalls, so this is a one-time step.
+Tailscale's state lives in `/var/lib/tailscale` and survives reboots and
+upgrades, so this is a one-time step. Uninstalling is the exception — it logs
+the node out and deletes the state, so a later reinstall logs in fresh.
 
 If the Tailscale iOS app is already on the device holding the hostname you asked
 for, your node gets the next free name (`iphone-1`).
@@ -83,9 +99,7 @@ node, then ⋯ → **Disable key expiry**.
 
 ### 4. Check it works
 
-```sh
-curl https://<your-node>.<tailnet>.ts.net/          # -> ok
-```
+Open your public URL in any browser. It answers `ok`.
 
 Then open the app on the phone and scan the QR with
 [FindMyForwarder](https://github.com/jjoelj/FindMyForwarder). The QR carries the
@@ -110,6 +124,17 @@ tailscale --socket=/var/run/lss-tailscaled.socket serve --bg --tcp 2222 tcp://12
 Do this *before* you remove any other Tailscale client from the device, or you
 will lock yourself out of it.
 
+## Uninstall
+
+Remove it the way you installed it, from your package manager.
+
+Removal leaves nothing behind. The package logs the node out of your tailnet on
+its way out — otherwise it would linger there with Funnel on — and deletes the
+node's private key in `/var/lib/tailscale`, the API token in
+`/var/mobile/Library/LocationSpoofServer`, and its three logs in `/var/log`.
+
+Upgrades are left alone: your login and token survive them.
+
 ## Releases
 
 The version lives in `control`, and nowhere else. Bump it there, then tag the
@@ -121,8 +146,8 @@ git tag v0.2.0 && git push origin v0.2.0   # must match Version: 0.2.0 in contro
 
 A tag that disagrees with `control` fails the build instead of shipping.
 
-Then add `https://<user>.github.io/<repo>/` in Sileo, and upgrades arrive like
-any other package. `.github/workflows/repo.yml` does it in one job:
+Upgrades then arrive on the phone like any other package.
+`.github/workflows/repo.yml` does it in one job:
 
 1. **Clone Theos** — the build system this Makefile already includes.
 2. **Fetch the toolchain and SDK** — a clang that emits Mach-O arm64 from Linux
@@ -133,7 +158,7 @@ any other package. `.github/workflows/repo.yml` does it in one job:
 3. **Build** with `FINALPACKAGE=1` and `PACKAGE_VERSION=` the version from
    `control`. The override matters even though it repeats `control`: Theos
    otherwise appends its own build counter, which restarts at 1 on a fresh
-   checkout and would look like a downgrade to Sileo.
+   checkout and would look like a downgrade to the client.
 4. **Index** — `dpkg-scanpackages` writes `Packages`, plus a hand-written
    `Release` naming the repo. That, a `Packages.gz` and the `.deb` under
    `debs/` is the whole of an APT repository.
@@ -144,8 +169,8 @@ One-time setup: **Settings → Pages → Source: GitHub Actions**. Without it th
 deploy step fails. Manual runs (**Actions → Run workflow**) publish a
 `0.1.0~ci<n>` build for testing; `~` sorts below the plain version, so the real tag supersedes it.
 
-The published repo carries no GPG signature and no hashes in `Release`. Sileo
-and Zebra do not check either over HTTPS; `apt` on a desktop would complain.
+The published repo carries no GPG signature and no hashes in `Release`. The
+jailbreak clients do not check either over HTTPS; `apt` on a desktop would.
 
 ## Why the Tailscale binaries need patching
 
@@ -199,8 +224,6 @@ has leaked; that invalidates the old one immediately.
 
 ## Logs
 
-```sh
-tail -f /var/log/locationspoofd.log
-tail -f /var/log/fmfwatchd.log
-tail -f /var/log/tailscaled.log
-```
+The app shows both live: SERVER LOG is the daemon's, APP LOG is the app's own.
+On disk they are `/var/log/locationspoofd.log`, `/var/log/fmfwatchd.log` and
+`/var/log/tailscaled.log`.

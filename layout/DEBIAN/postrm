@@ -9,4 +9,16 @@ for d in locationspoofd fmfwatchd tailscaled; do
 	launchctl remove io.github.jjoelj.$d 2>/dev/null || true
 done
 
+# Nothing of ours survives an uninstall: the node's private key, the API token
+# and the logs all go. Guarded on the action because dpkg also calls this with
+# "upgrade" and "failed-upgrade", where wiping state would be a bug.
+case "$1" in
+	remove|purge)
+		rm -rf /var/lib/tailscale
+		rm -rf /var/mobile/Library/LocationSpoofServer
+		rm -f /var/log/locationspoofd.log /var/log/fmfwatchd.log /var/log/tailscaled.log
+		rm -f /var/run/lss-tailscaled.socket
+		;;
+esac
+
 exit 0
