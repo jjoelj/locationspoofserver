@@ -1,4 +1,4 @@
-Package: app.bluebubbles.locationspoofserver
+Package: io.github.jjoelj.locationspoofserver
 Name: Location Spoof Server
 Version: 0.0.1
 Architecture: iphoneos-arm

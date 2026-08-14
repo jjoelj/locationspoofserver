@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>app.bluebubbles.fmfwatchd</string>
+  <string>io.github.jjoelj.locationspoofd</string>
 
   <key>POSIXSpawnType</key>
   <string>Interactive</string>
@@ -15,7 +15,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/libexec/fmfwatchd</string>
+    <string>/usr/libexec/locationspoofd</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -24,8 +24,8 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/var/log/fmfwatchd.log</string>
+  <string>/var/log/locationspoofd.log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/fmfwatchd.log</string>
+  <string>/var/log/locationspoofd.log</string>
 </dict>
 </plist>

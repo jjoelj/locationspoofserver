@@ -46,9 +46,9 @@ fmfwatchd_CODESIGN_FLAGS = -Sentitlements_fmf.plist
 include $(THEOS_MAKE_PATH)/tool.mk
 
 after-install::
-	install.exec "launchctl unload /Library/LaunchDaemons/app.bluebubbles.fmfwatchd.plist 2>/dev/null || true"
-	install.exec "launchctl load /Library/LaunchDaemons/app.bluebubbles.fmfwatchd.plist"
-	install.exec "launchctl start app.bluebubbles.fmfwatchd || true"
-	install.exec "launchctl unload /Library/LaunchDaemons/app.bluebubbles.locationspoofd.plist 2>/dev/null || true"
-	install.exec "launchctl load /Library/LaunchDaemons/app.bluebubbles.locationspoofd.plist"
-	install.exec "launchctl start app.bluebubbles.locationspoofd || true"
+	install.exec "launchctl unload /Library/LaunchDaemons/io.github.jjoelj.fmfwatchd.plist 2>/dev/null || true"
+	install.exec "launchctl load /Library/LaunchDaemons/io.github.jjoelj.fmfwatchd.plist"
+	install.exec "launchctl start io.github.jjoelj.fmfwatchd || true"
+	install.exec "launchctl unload /Library/LaunchDaemons/io.github.jjoelj.locationspoofd.plist 2>/dev/null || true"
+	install.exec "launchctl load /Library/LaunchDaemons/io.github.jjoelj.locationspoofd.plist"
+	install.exec "launchctl start io.github.jjoelj.locationspoofd || true"
