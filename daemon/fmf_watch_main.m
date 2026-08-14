@@ -73,7 +73,7 @@ static NSTimeInterval gRefreshCacheWindow;
 // My app is driving its own session. FMFCore exposes no way to revive it and a
 // fresh process works immediately, so we bail and let the plist's KeepAlive
 // respawn us with a new session.
-// ponytail: restart-on-stall beats reimplementing session recovery; revisit if
+// Restart-on-stall beats reimplementing session recovery; revisit if
 // a real reconnect selector ever turns up in FMFCore.
 static NSUInteger gDeadRefreshStreak;
 static const NSUInteger kDeadRefreshStreakLimit = 3;
@@ -407,7 +407,7 @@ static NSDictionary *Refresh(NSString *handle, NSString *callerId, long long pri
 // FMF leaves shortAddress/longAddress nil for some friends even on valid
 // fixes, so we reverse-geocode those coords ourselves and cache the result
 // per handle. Async: the address shows up on the next /friends read.
-// ponytail: one CLGeocoder shared, throttled requests just retry next read.
+// One CLGeocoder shared, throttled requests just retry next read.
 static NSMutableDictionary<NSString *, NSDictionary *> *gGeocode;
 static NSMutableSet<NSString *> *gGeocoding;
 

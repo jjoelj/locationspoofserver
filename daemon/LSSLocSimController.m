@@ -5,7 +5,7 @@
 
 // locationd holds the simulation session; if it restarts, our session dies
 // silently. Returns locationd's current pid, or -1 if not found.
-// ponytail: KERN_PROC_ALL scan, ~one call per push. Fine at push rates.
+// KERN_PROC_ALL scan, ~one call per push. Fine at push rates.
 static pid_t locationd_pid(void) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t len = 0;
