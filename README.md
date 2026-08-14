@@ -2,12 +2,14 @@
 
 An HTTP server for a jailbroken iPhone that sets the device's simulated location
 on demand, and reports back battery level and the locations of your Find My
-friends. It ships a small UI app, four LaunchDaemons, and a Tailscale node so
+friends. It ships a small UI app, three LaunchDaemons, and a Tailscale node so
 the phone can be reached from anywhere without a relay box in the middle.
 
 The client is **[FindMyForwarder](https://github.com/jjoelj/FindMyForwarder)**,
 an Android app that scans the QR code this one displays and takes it from there.
 The API below is plain HTTP, though, so anything that can make a request works.
+
+<img src="screenshot.png" alt="The app: masked token and public URL, daemon status, server and app logs" width="320">
 
 ## Requirements
 
@@ -26,7 +28,7 @@ The API below is plain HTTP, though, so anything that can make a request works.
 
 | Path | What it is |
 | --- | --- |
-| `/Applications/LocationSpoofServer.app` | UI: shows the API token as a QR code, lets you regenerate it |
+| `/Applications/LocationSpoofServer.app` | UI: token and public URL as text or QR, Tailscale login, server restart |
 | `/usr/libexec/locationspoofd` | The server. Public API on `:8080`, control API on `127.0.0.1:31666` |
 | `/usr/libexec/fmfwatchd` | Find My friends watcher, kept separate for entitlement reasons |
 | `/usr/libexec/tsboot` | Starts tailscaled; launchd cannot spawn it directly (see below) |
@@ -88,6 +90,10 @@ curl https://<your-node>.<tailnet>.ts.net/          # -> ok
 Then open the app on the phone and scan the QR with
 [FindMyForwarder](https://github.com/jjoelj/FindMyForwarder). The QR carries the
 public URL and the token together, so there is nothing to type in.
+
+The token and the URL are both masked until you tap **Show**, and whatever is
+masked above is masked in the log panes below it too, so a screenshot of the
+app leaks neither.
 
 ### Optional: SSH over the tailnet
 
@@ -172,7 +178,8 @@ already; the rest of this section is for anything else you point at the phone.
 
 Every endpoint except `/` requires `?token=...`. Get the token from the app —
 it's shown as text and as a QR code — or from the device itself with
-`curl 127.0.0.1:31666/token`.
+`curl 127.0.0.1:31666/token`. Tokens are 128 random bits, generated on the
+device; there is no way to set one by hand.
 
 | Endpoint | Does |
 | --- | --- |

@@ -129,7 +129,13 @@ static NSData *ReadExact(int fd, size_t n) {
         query = [target substringFromIndex:qmark.location + 1];
     }
 
-    if (![target isEqualToString:@"/logs"]) {
+    // The app polls these twice a second; logging them buries everything that
+    // happened for a reason. Anything that changes state still gets logged.
+    static NSSet *quiet;
+    static dispatch_once_t onceQuiet;
+    dispatch_once(&onceQuiet, ^{ quiet = [NSSet setWithArray:@[@"/logs", @"/status", @"/token"]]; });
+
+    if (![quiet containsObject:path]) {
         [[LSSLogger shared] log:[NSString stringWithFormat:@"%@ %@", method, target] tag:@"HTTP"];
     }
 
