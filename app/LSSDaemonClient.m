@@ -50,14 +50,20 @@
     }];
 }
 
-- (void)setToken:(NSString *)token completion:(void (^)(BOOL ok, NSString *message))completion {
-    [self request:@"/token" method:@"POST" json:@{@"token": token} completion:^(BOOL ok, NSDictionary *resp) {
+- (void)restartDaemon:(void (^)(BOOL ok, NSString *message))completion {
+    [self request:@"/restart" method:@"POST" json:@{} completion:^(BOOL ok, NSDictionary *resp) {
         completion(ok, resp[@"message"] ?: @"");
     }];
 }
 
-- (void)restartDaemon:(void (^)(BOOL ok, NSString *message))completion {
-    [self request:@"/restart" method:@"POST" json:@{} completion:^(BOOL ok, NSDictionary *resp) {
+- (void)tailscaleLogin:(void (^)(BOOL ok, NSString *loginURL, NSString *message))completion {
+    [self request:@"/tailscale/login" method:@"POST" json:@{} completion:^(BOOL ok, NSDictionary *resp) {
+        completion(ok, resp[@"loginURL"] ?: @"", resp[@"message"] ?: @"");
+    }];
+}
+
+- (void)tailscaleLogout:(void (^)(BOOL ok, NSString *message))completion {
+    [self request:@"/tailscale/logout" method:@"POST" json:@{} completion:^(BOOL ok, NSDictionary *resp) {
         completion(ok, resp[@"message"] ?: @"");
     }];
 }

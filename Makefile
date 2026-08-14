@@ -85,33 +85,10 @@ $(TS_BIN)/%:
 	python3 tools/ios_platform.py $@
 	$(LDID) -S $@
 
-after-install::
-	install.exec "launchctl unload /Library/LaunchDaemons/io.github.jjoelj.fmfwatchd.plist 2>/dev/null || true"
-	install.exec "launchctl load /Library/LaunchDaemons/io.github.jjoelj.fmfwatchd.plist"
-	install.exec "launchctl start io.github.jjoelj.fmfwatchd || true"
-	install.exec "launchctl unload /Library/LaunchDaemons/io.github.jjoelj.locationspoofd.plist 2>/dev/null || true"
-	install.exec "launchctl load /Library/LaunchDaemons/io.github.jjoelj.locationspoofd.plist"
-	install.exec "launchctl start io.github.jjoelj.locationspoofd || true"
-	install.exec "launchctl unload /Library/LaunchDaemons/io.github.jjoelj.tailscaled.plist 2>/dev/null || true"
-	install.exec "launchctl load /Library/LaunchDaemons/io.github.jjoelj.tailscaled.plist"
-	install.exec "launchctl start io.github.jjoelj.tailscaled || true"
-
-# Drop your key in tailscale.authkey (gitignored) and install logs the node in
-# for you. The key is passed over SSH at install time, never baked into the deb.
-ifneq ($(wildcard tailscale.authkey),)
-after-install::
-	@install.exec "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do $(TS_CLI) status >/dev/null 2>&1 && break; sleep 2; done; \
-	  if $(TS_CLI) status >/dev/null 2>&1; then echo 'tailscale: already logged in, key not used'; \
-	  else $(TS_CLI) up --authkey='$(shell cat tailscale.authkey)' --hostname=iphone \
-	       || echo 'WARNING: tailscale up failed. If your auth key was single-use and is already spent, generate a new one or run tailscale up on the device.'; fi"
-	install.exec "$(TS_CLI) funnel --bg 8080"
-	install.exec "$(TS_CLI) funnel status"
-else
+# Daemon loading lives in layout/DEBIAN/postinst, so a Sileo install gets it
+# too; dpkg runs that for `make install` as well. Nothing to repeat here.
 after-install::
 	@echo ""
-	@echo "  !! tailscale.authkey not found -- the phone is NOT reachable from"
-	@echo "  !! outside your network. Copy tailscale.authkey.example to"
-	@echo "  !! tailscale.authkey, paste a key from"
-	@echo "  !! https://login.tailscale.com/admin/settings/keys, and reinstall."
+	@echo "  Not logged into Tailscale yet: open LocationSpoofServer on the"
+	@echo "  phone and tap 'Log in to Tailscale'."
 	@echo ""
-endif

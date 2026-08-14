@@ -60,6 +60,21 @@ static NSString *RedactToken(NSString *query) {
     return [parts componentsJoinedByString:@"&"];
 }
 
+// Constant-time compare, and the only place the token is checked. Remote timing
+// on a 128-bit token is theoretical, but this is the one gate on an endpoint
+// that is reachable from the open internet, so it does not get to be sloppy.
+static BOOL TokenOK(NSString *given, NSString *want) {
+    if (given == nil || want.length == 0) return NO;
+    NSData *a = [given dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *b = [want dataUsingEncoding:NSUTF8StringEncoding];
+    if (a.length != b.length) return NO;
+
+    const uint8_t *pa = a.bytes, *pb = b.bytes;
+    uint8_t diff = 0;
+    for (NSUInteger i = 0; i < a.length; i++) diff |= pa[i] ^ pb[i];
+    return diff == 0;
+}
+
 static void WriteHTTP(int fd, int status, const char *statusText, const char *body) {
     if (!body) body = "";
     size_t bodyLen = strlen(body);
@@ -68,6 +83,7 @@ static void WriteHTTP(int fd, int status, const char *statusText, const char *bo
     int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n",
@@ -82,6 +98,7 @@ static void WriteJSONBody(int fd, int status, const char *statusText, NSString *
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d %s\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
         status, statusText, (size_t)body.length);
     (void)write(fd, hdr, (size_t)hn);
@@ -95,6 +112,7 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d %s\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
         status, statusText, (size_t)body.length);
     (void)write(fd, hdr, (size_t)hn);
@@ -102,6 +120,14 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
 }
 
 - (void)handleClient:(int)cfd {
+    // This socket is reachable from the internet through Funnel. A client that
+    // connects and then says nothing would otherwise park a GCD worker forever,
+    // and enough of them starve the pool -- so give every read and write a
+    // deadline instead of trusting the peer to be well behaved.
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     // Read request (simple, assumes it fits in buffer for this test)
     char buf[4096];
     ssize_t n = read(cfd, buf, sizeof(buf) - 1);
@@ -148,8 +174,7 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
 
     if ([path isEqualToString:@"/friends"] || [path isEqualToString:@"/friends/refresh"]) {
         NSDictionary *q = ParseQuery(query);
-        NSString *token = q[@"token"];
-        if (token == nil || ![token isEqualToString:self.authToken]) {
+        if (!TokenOK(q[@"token"], self.authToken)) {
             WriteHTTP(cfd, 403, "Forbidden", "invalid or missing token\n");
             close(cfd);
             return;
@@ -167,8 +192,7 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
 
     if ([path isEqualToString:@"/battery"]) {
         NSDictionary *q = ParseQuery(query);
-        NSString *token = q[@"token"];
-        if (token == nil || ![token isEqualToString:self.authToken]) {
+        if (!TokenOK(q[@"token"], self.authToken)) {
             WriteHTTP(cfd, 403, "Forbidden", "invalid or missing token\n");
             close(cfd);
             return;
@@ -185,9 +209,8 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
         NSDictionary *q = ParseQuery(query);
         NSString *lat = q[@"lat"];
         NSString *lon = q[@"lon"];
-        NSString *token = q[@"token"];
 
-        if (token == nil || ![token isEqualToString:self.authToken]) {
+        if (!TokenOK(q[@"token"], self.authToken)) {
             WriteHTTP(cfd, 403, "Forbidden", "invalid or missing token\n");
             close(cfd);
             return;
@@ -217,7 +240,9 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
             self.locationSink(dlat, dlon);
         }
 
-        NSString *resp = [NSString stringWithFormat:@"received lat=%@ lon=%@\n", lat, lon];
+        // Echo what we parsed, not what was sent: no unbounded caller-controlled
+        // string gets reflected back out of this server.
+        NSString *resp = [NSString stringWithFormat:@"received lat=%.6f lon=%.6f\n", dlat, dlon];
         WriteHTTP(cfd, 200, "OK", resp.UTF8String);
         close(cfd);
         return;

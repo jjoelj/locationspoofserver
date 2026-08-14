@@ -4,4 +4,9 @@ echo "Killing locationd..."
 
 killall -9 locationd || true
 
+# The plists are gone by now, so unload them by label instead of by path.
+for d in locationspoofd fmfwatchd tailscaled; do
+	launchctl remove io.github.jjoelj.$d 2>/dev/null || true
+done
+
 exit 0

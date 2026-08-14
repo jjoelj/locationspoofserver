@@ -7,4 +7,14 @@ killall -9 locationd || true
 # Holds the node's private key, so keep it root-only.
 mkdir -p -m 700 /var/lib/tailscale
 
+# Start the daemons here, not just from `make install`: a Sileo install has no
+# Makefile behind it, and without this the package sits inert until a reboot.
+# Unload first so an upgrade actually picks up the new binaries.
+for d in locationspoofd fmfwatchd tailscaled; do
+	plist=/Library/LaunchDaemons/io.github.jjoelj.$d.plist
+	launchctl unload "$plist" 2>/dev/null || true
+	launchctl load "$plist" || true
+	launchctl start io.github.jjoelj.$d || true
+done
+
 exit 0

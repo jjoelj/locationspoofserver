@@ -201,16 +201,23 @@ static NSData *ReadExact(int fd, size_t n) {
         return;
     }
 
-    if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/token/regenerate"]) {
-        WriteJSON(cfd, 200, [dc regenerateToken]);
+    // Slow on purpose: waits for tailscale to hand back a login link.
+    if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/tailscale/login"]) {
+        NSDictionary *resp = [dc tailscaleLogin];
+        WriteJSON(cfd, [resp[@"ok"] boolValue] ? 200 : 500, resp);
         close(cfd);
         return;
     }
 
-    if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/token"]) {
-        NSString *tok = [json[@"token"] isKindOfClass:[NSString class]] ? json[@"token"] : @"";
-        NSDictionary *resp = [dc applyToken:tok];
-        WriteJSON(cfd, [resp[@"ok"] boolValue] ? 200 : 400, resp);
+    if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/tailscale/logout"]) {
+        NSDictionary *resp = [dc tailscaleLogout];
+        WriteJSON(cfd, [resp[@"ok"] boolValue] ? 200 : 500, resp);
+        close(cfd);
+        return;
+    }
+
+    if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/token/regenerate"]) {
+        WriteJSON(cfd, 200, [dc regenerateToken]);
         close(cfd);
         return;
     }

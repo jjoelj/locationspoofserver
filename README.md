@@ -42,40 +42,30 @@ tailscale --socket=/var/run/lss-tailscaled.socket status
 
 ## Setup
 
-### 1. Get an auth key
-
-The build needs a Tailscale auth key to log the phone into your tailnet. Get
-one from <https://login.tailscale.com/admin/settings/keys> ("Generate auth
-key"), then:
-
-```sh
-echo 'tskey-auth-...' > tailscale.authkey
-```
-
-The file holds the key and nothing else. Writing it this way leaves the key in
-your shell history; `cp tailscale.authkey.example tailscale.authkey` and pasting
-into an editor avoids that.
-
-`tailscale.authkey` is gitignored — your key stays on your machine. It is
-handed to the phone over SSH at install time and never written into the `.deb`.
-
-Skip this and the install still succeeds, but it prints a warning and the phone
-stays unreachable from outside your network until you add the key and reinstall.
-
-### 2. Install
+### 1. Install
 
 ```sh
 THEOS_DEVICE_IP=iphone make package install
 ```
 
 Substitute your phone's hostname or IP. That cross-compiles Tailscale, builds
-the app and daemons, installs the `.deb`, loads all four daemons, joins the
-tailnet, turns on Funnel, and prints your public URL — something like
-`https://iphone.<tailnet>.ts.net`.
+the app and daemons, and installs the `.deb`. The daemons are loaded by the
+package's `postinst`, so a Sileo install starts them the same way.
+
+Or install from the Sileo source instead — see [Releases](#releases) below.
+
+### 2. Log into Tailscale
+
+Open LocationSpoofServer on the phone and tap **Log in to Tailscale**. It opens
+the Tailscale login page in Safari; sign in, approve the node, and the app fills
+in your public URL — something like `https://iphone.<tailnet>.ts.net`. Funnel is
+turned on for you at that point.
+
+The same button becomes **Log out of Tailscale** once connected, which drops the
+node from your tailnet and takes the public URL down until you log in again.
 
 Tailscale's state lives in `/var/lib/tailscale` and survives reboots and later
-reinstalls. Reinstalling prints `already logged in, key not used` and leaves
-your auth key untouched, which matters if it was single-use.
+reinstalls, so this is a one-time step.
 
 If the Tailscale iOS app is already on the device holding the hostname you asked
 for, your node gets the next free name (`iphone-1`).
@@ -83,8 +73,8 @@ for, your node gets the next free name (`iphone-1`).
 ### 3. Disable key expiry
 
 Node keys expire after 180 days by default. When that happens the public URL
-goes dark until someone re-authenticates on the phone, and your auth key is
-long spent. This is a headless daemon; nobody is going to see that prompt.
+goes dark until someone re-authenticates on the phone. This is a headless
+daemon; nobody is going to see that prompt.
 
 In the [admin console](https://login.tailscale.com/admin/machines), find the
 node, then ⋯ → **Disable key expiry**.
@@ -113,6 +103,43 @@ tailscale --socket=/var/run/lss-tailscaled.socket serve --bg --tcp 2222 tcp://12
 
 Do this *before* you remove any other Tailscale client from the device, or you
 will lock yourself out of it.
+
+## Releases
+
+The version lives in `control`, and nowhere else. Bump it there, then tag the
+commit to build and publish:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0   # must match Version: 0.2.0 in control
+```
+
+A tag that disagrees with `control` fails the build instead of shipping.
+
+Then add `https://<user>.github.io/<repo>/` in Sileo, and upgrades arrive like
+any other package. `.github/workflows/repo.yml` does it in one job:
+
+1. **Clone Theos** — the build system this Makefile already includes.
+2. **Fetch the toolchain and SDK** — a clang that emits Mach-O arm64 from Linux
+   (`L1ghtmann/llvm-project`) and the patched `iPhoneOS16.5.sdk`
+   (`theos/sdks`). Both are the same artefacts `install-theos` fetches for a
+   local setup, pinned by release tag in the workflow's `env:` block, and
+   cached on that pin. Bump the pins by hand when you want newer ones.
+3. **Build** with `FINALPACKAGE=1` and `PACKAGE_VERSION=` the version from
+   `control`. The override matters even though it repeats `control`: Theos
+   otherwise appends its own build counter, which restarts at 1 on a fresh
+   checkout and would look like a downgrade to Sileo.
+4. **Index** — `dpkg-scanpackages` writes `Packages`, plus a hand-written
+   `Release` naming the repo. That, a `Packages.gz` and the `.deb` under
+   `debs/` is the whole of an APT repository.
+5. **Deploy** to Pages with GitHub's own `upload-pages-artifact` and
+   `deploy-pages` actions. No third-party actions are used anywhere.
+
+One-time setup: **Settings → Pages → Source: GitHub Actions**. Without it the
+deploy step fails. Manual runs (**Actions → Run workflow**) publish a
+`0.1.0+ci<n>` build for testing, which sorts below any real tag.
+
+The published repo carries no GPG signature and no hashes in `Release`. Sileo
+and Zebra do not check either over HTTPS; `apt` on a desktop would complain.
 
 ## Why the Tailscale binaries need patching
 

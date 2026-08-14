@@ -46,18 +46,25 @@ static UIImage *QRImage(NSString *string) {
 @property(nonatomic, strong) UILabel *tokenCaption;
 @property(nonatomic, strong) UILabel *tokenLabel;
 @property(nonatomic, strong) UIButton *tokenEyeBtn;
-@property(nonatomic, strong) UIButton *tokenEditBtn;
-@property(nonatomic, strong) UIButton *tokenRegenBtn;
-@property(nonatomic, strong) UIButton *tokenQRBtn;
-@property(nonatomic, strong) UIButton *restartBtn;
+@property(nonatomic, strong) UIButton *urlEyeBtn;
+@property(nonatomic, strong) UIActivityIndicatorView *loginSpinner;
+@property(nonatomic, strong) UIButton *tailscaleBtn;
+@property(nonatomic, strong) UIStackView *tokenActions;
+@property(nonatomic, strong) UIStackView *serverActions;
 @property(nonatomic, strong) UILabel *urlCaption;
+@property(nonatomic, strong) UILabel *statusCaption;
+@property(nonatomic, strong) UILabel *serverLogCaption;
+@property(nonatomic, strong) UILabel *logCaption;
 @property(nonatomic, strong) UILabel *urlLabel;
 @property(nonatomic, strong) UIStackView *statusRow;
 @property(nonatomic, strong) NSDictionary<NSString *, UILabel *> *statusLabels;
 @property(nonatomic, copy) NSString *token;
 @property(nonatomic, copy) NSString *publicURL;
 @property(nonatomic, assign) BOOL tokenHidden;
+@property(nonatomic, assign) BOOL urlHidden;
+@property(nonatomic, assign) BOOL loginInFlight;
 @property(nonatomic, strong) UIImage *qrCache; // built once; math is not free
+@property(nonatomic, copy) NSString *serverLogRaw; // uncensored; masked at render
 
 @property(nonatomic, strong) NSTimer *logTimer;
 @end
@@ -70,6 +77,7 @@ static UIImage *QRImage(NSString *string) {
 
     self.daemon = [[LSSDaemonClient alloc] init];
     self.tokenHidden = YES;
+    self.urlHidden = YES;
 
     [self buildUI];
     [self startLogPolling];
@@ -89,22 +97,94 @@ static UIImage *QRImage(NSString *string) {
     }];
 }
 
-// The URL alone is not a secret: every endpoint but / needs the token, so it is
-// shown in full rather than masked like the token is.
+// The URL is not a secret the way the token is -- every endpoint but / still
+// needs the token -- but it names the device on the public internet, so it is
+// masked by default and revealed on request. Screenshots stay postable.
 - (void)updateURLDisplay {
-    if (self.publicURL.length) {
-        self.urlLabel.text = self.publicURL;
+    BOOL connected = self.publicURL.length > 0;
+    if (connected) {
+        self.urlLabel.text = self.urlHidden ? @"••••••••••••••••••••" : self.publicURL;
         self.urlLabel.textColor = [UIColor secondaryLabelColor];
     } else {
         self.urlLabel.text = @"Tailscale not connected";
         self.urlLabel.textColor = [UIColor systemOrangeColor];
     }
+    [self.urlEyeBtn setTitle:(self.urlHidden ? @"Show URL" : @"Hide URL") forState:UIControlStateNormal];
+    self.urlEyeBtn.enabled = connected;
+
+    // One button, three states: logging in, or whichever of log in / log out
+    // makes sense once we know. The poll timer calls through here every half
+    // second, so the in-flight title has to be reasserted, not set once.
+    NSString *title = self.loginInFlight ? @"Contacting…"
+                                         : (connected ? @"Log out of Tailscale" : @"Log in to Tailscale");
+    [self.tailscaleBtn setTitle:title forState:UIControlStateNormal];
+    self.tailscaleBtn.enabled = !self.loginInFlight;
+    self.tailscaleBtn.tintColor = connected ? [UIColor systemRedColor] : [UIColor systemBlueColor];
+    if (self.loginInFlight) [self.loginSpinner startAnimating]; else [self.loginSpinner stopAnimating];
 }
 
-- (void)copyURL {
+- (void)toggleURLVisibility {
+    self.urlHidden = !self.urlHidden;
+    [self updateURLDisplay];
+    [self refreshLogViews];
+}
+
+- (void)tapURL {
     if (self.publicURL.length == 0) return;
     [UIPasteboard generalPasteboard].string = self.publicURL;
     [self log:@"public url copied"];
+}
+
+- (void)tapTailscale {
+    if (self.publicURL.length == 0) {
+        [self loginToTailscale];
+        return;
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Log out of Tailscale?"
+                                                                  message:@"The public URL stops working until you log in again from this app."
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Log Out" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+        [weakSelf.daemon tailscaleLogout:^(BOOL ok, NSString *message) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf log:ok ? @"logged out of tailscale"
+                                 : [NSString stringWithFormat:@"logout failed: %@", message]];
+                [weakSelf fetchToken];
+            });
+        }];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// The daemon runs `tailscale up` and we hand its login page to Safari. The
+// poll timer picks up the public URL once the login goes through.
+- (void)loginToTailscale {
+    [self log:@"asking tailscale for a login link…"];
+    self.loginInFlight = YES;   // `tailscale up` can sit there for seconds
+    [self updateURLDisplay];
+
+    __weak typeof(self) weakSelf = self;
+    [self.daemon tailscaleLogin:^(BOOL ok, NSString *loginURL, NSString *message) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.loginInFlight = NO;
+            [weakSelf updateURLDisplay];
+            if (!ok) {
+                [weakSelf log:[NSString stringWithFormat:@"tailscale login failed: %@", message]];
+                return;
+            }
+            if (loginURL.length == 0) {
+                [weakSelf log:@"tailscale already logged in"];
+                [weakSelf fetchToken];
+                return;
+            }
+            [weakSelf log:@"opening tailscale login in Safari…"];
+            [[UIApplication sharedApplication] openURL:[NSURL URLWithString:loginURL]
+                                               options:@{}
+                                     completionHandler:nil];
+        });
+    }];
 }
 
 // Bullets when hidden, the value when revealed; keeps the eye icon in sync.
@@ -117,42 +197,13 @@ static UIImage *QRImage(NSString *string) {
     } else {
         self.tokenLabel.text = self.token;
     }
-    NSString *icon = self.tokenHidden ? @"eye" : @"eye.slash";
-    [self.tokenEyeBtn setImage:[UIImage systemImageNamed:icon] forState:UIControlStateNormal];
+    [self.tokenEyeBtn setTitle:(self.tokenHidden ? @"Show" : @"Hide") forState:UIControlStateNormal];
 }
 
 - (void)toggleTokenVisibility {
     self.tokenHidden = !self.tokenHidden;
     [self updateTokenDisplay];
-}
-
-- (void)editToken {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Set Token"
-                                                                   message:@"8-128 chars of A-Za-z0-9._~-"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"new token";
-        tf.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-        tf.autocorrectionType = UITextAutocorrectionTypeNo;
-        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-    __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
-        NSString *tok = alert.textFields.firstObject.text ?: @"";
-        [weakSelf.daemon setToken:tok completion:^(BOOL ok, NSString *message) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) {
-                    [weakSelf log:@"token updated"];
-                    [weakSelf fetchToken];
-                } else {
-                    [weakSelf log:[NSString stringWithFormat:@"set token failed: %@", message]];
-                }
-            });
-        }];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
+    [self refreshLogViews];
 }
 
 - (void)regenerateToken {
@@ -262,11 +313,15 @@ static UIImage *QRImage(NSString *string) {
 
 #pragma mark - UI
 
+// Words, not glyphs: an eye or a pencil is a guessing game, "Show" and
+// "Regenerate" are not. Titles shrink rather than truncate on narrow screens.
 - (UIButton *)makeButton:(NSString *)title action:(SEL)sel {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-    b.contentEdgeInsets = UIEdgeInsetsMake(10, 12, 10, 12);
+    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.7;
+    b.contentEdgeInsets = UIEdgeInsetsMake(9, 6, 9, 6);
     b.layer.cornerRadius = 10;
     b.layer.borderWidth = 1.0;
     b.layer.borderColor = [UIColor systemGray4Color].CGColor;
@@ -274,11 +329,28 @@ static UIImage *QRImage(NSString *string) {
     return b;
 }
 
+- (UIStackView *)makeButtonRow:(NSArray<UIButton *> *)buttons {
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:buttons];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.distribution = UIStackViewDistributionFillEqually;
+    row.spacing = 8;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    // Buttons hug like a text view does by default; without this the vertical
+    // stack grows the button rows instead of the log panes.
+    [row setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
+    return row;
+}
+
+- (UILabel *)makeCaption:(NSString *)text {
+    UILabel *l = [[UILabel alloc] init];
+    l.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    l.textColor = [UIColor tertiaryLabelColor];
+    l.text = text;
+    return l;
+}
+
 - (void)buildUI {
-    self.tokenCaption = [[UILabel alloc] init];
-    self.tokenCaption.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    self.tokenCaption.textColor = [UIColor tertiaryLabelColor];
-    self.tokenCaption.text = @"TOKEN";
+    self.tokenCaption = [self makeCaption:@"TOKEN"];
 
     self.tokenLabel = [[UILabel alloc] init];
     self.tokenLabel.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
@@ -287,24 +359,14 @@ static UIImage *QRImage(NSString *string) {
     self.tokenLabel.minimumScaleFactor = 0.6;
     self.tokenLabel.text = @"loading token…";
 
-    self.tokenEyeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.tokenEyeBtn setImage:[UIImage systemImageNamed:@"eye"] forState:UIControlStateNormal];
-    [self.tokenEyeBtn addTarget:self action:@selector(toggleTokenVisibility) forControlEvents:UIControlEventTouchUpInside];
+    self.tokenEyeBtn = [self makeButton:@"Show" action:@selector(toggleTokenVisibility)];
+    self.tokenActions = [self makeButtonRow:@[
+        self.tokenEyeBtn,
+        [self makeButton:@"Regenerate" action:@selector(regenerateToken)],
+        [self makeButton:@"QR code" action:@selector(showQR)],
+    ]];
 
-    self.tokenEditBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.tokenEditBtn setImage:[UIImage systemImageNamed:@"pencil"] forState:UIControlStateNormal];
-    [self.tokenEditBtn addTarget:self action:@selector(editToken) forControlEvents:UIControlEventTouchUpInside];
-
-    self.tokenRegenBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.tokenRegenBtn setImage:[UIImage systemImageNamed:@"arrow.clockwise"] forState:UIControlStateNormal];
-    [self.tokenRegenBtn addTarget:self action:@selector(regenerateToken) forControlEvents:UIControlEventTouchUpInside];
-
-    self.tokenQRBtn = [self makeButton:@"QR" action:@selector(showQR)];
-
-    self.urlCaption = [[UILabel alloc] init];
-    self.urlCaption.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    self.urlCaption.textColor = [UIColor tertiaryLabelColor];
-    self.urlCaption.text = @"PUBLIC URL";
+    self.urlCaption = [self makeCaption:@"PUBLIC URL — TAP TO COPY"];
 
     self.urlLabel = [[UILabel alloc] init];
     self.urlLabel.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
@@ -314,10 +376,11 @@ static UIImage *QRImage(NSString *string) {
     self.urlLabel.text = @"…";
     self.urlLabel.userInteractionEnabled = YES;
     [self.urlLabel addGestureRecognizer:
-        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(copyURL)]];
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapURL)]];
 
-    // One dot per daemon. Unknown until the first poll answers, so nothing
-    // claims to be up before we have actually asked.
+    // One dot per daemon: green up, red down, grey not asked yet. Unknown until
+    // the first poll answers, so nothing claims to be up before we have asked.
+    self.statusCaption = [self makeCaption:@"DAEMONS"];
     NSMutableDictionary *labels = [NSMutableDictionary dictionary];
     NSMutableArray *arranged = [NSMutableArray array];
     for (NSString *name in @[@"locationspoofd", @"fmfwatchd", @"tailscaled"]) {
@@ -333,11 +396,27 @@ static UIImage *QRImage(NSString *string) {
     self.statusRow.axis = UILayoutConstraintAxisHorizontal;
     self.statusRow.distribution = UIStackViewDistributionFillProportionally;
     self.statusRow.spacing = 10;
+    [self.statusRow setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
 
-    self.restartBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.restartBtn setImage:[UIImage systemImageNamed:@"power"] forState:UIControlStateNormal];
-    [self.restartBtn addTarget:self action:@selector(restartDaemon) forControlEvents:UIControlEventTouchUpInside];
+    self.urlEyeBtn = [self makeButton:@"Show URL" action:@selector(toggleURLVisibility)];
+    self.tailscaleBtn = [self makeButton:@"Log in to Tailscale" action:@selector(tapTailscale)];
 
+    // Rides on the button it describes, so there is no row to make space for.
+    self.loginSpinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    self.loginSpinner.hidesWhenStopped = YES;
+    self.loginSpinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.tailscaleBtn addSubview:self.loginSpinner];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.loginSpinner.trailingAnchor constraintEqualToAnchor:self.tailscaleBtn.trailingAnchor constant:-8],
+        [self.loginSpinner.centerYAnchor constraintEqualToAnchor:self.tailscaleBtn.centerYAnchor],
+    ]];
+    self.serverActions = [self makeButtonRow:@[
+        self.urlEyeBtn,
+        [self makeButton:@"Restart server" action:@selector(restartDaemon)],
+        self.tailscaleBtn,
+    ]];
+
+    self.serverLogCaption = [self makeCaption:@"SERVER LOG"];
     self.serverLogView = [[UITextView alloc] init];
     self.serverLogView.editable = NO;
     self.serverLogView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
@@ -345,6 +424,7 @@ static UIImage *QRImage(NSString *string) {
     self.serverLogView.layer.borderWidth = 1.0;
     self.serverLogView.layer.borderColor = [UIColor systemGray4Color].CGColor;
 
+    self.logCaption = [self makeCaption:@"APP LOG"];
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
     self.logView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
@@ -352,102 +432,70 @@ static UIImage *QRImage(NSString *string) {
     self.logView.layer.borderWidth = 1.0;
     self.logView.layer.borderColor = [UIColor systemGray4Color].CGColor;
 
-    UIView *container = [[UIView alloc] init];
-    [self.view addSubview:container];
-    [container addSubview:self.tokenCaption];
-    [container addSubview:self.tokenLabel];
-    [container addSubview:self.tokenEyeBtn];
-    [container addSubview:self.tokenEditBtn];
-    [container addSubview:self.tokenRegenBtn];
-    [container addSubview:self.tokenQRBtn];
-    [container addSubview:self.restartBtn];
-    [container addSubview:self.urlCaption];
-    [container addSubview:self.urlLabel];
-    [container addSubview:self.statusRow];
-    [container addSubview:self.serverLogView];
-    [container addSubview:self.logView];
+    // One vertical stack, top to bottom: token, public URL, server actions,
+    // daemon dots, then the two log panes. Spacing comes from the stack, so
+    // there is nothing to re-pin when a row moves.
+    UIStackView *column = [[UIStackView alloc] initWithArrangedSubviews:@[
+        self.tokenCaption, self.tokenLabel, self.tokenActions,
+        self.urlCaption, self.urlLabel,
+        self.serverActions,
+        self.statusCaption, self.statusRow,
+        self.serverLogCaption, self.serverLogView,
+        self.logCaption, self.logView,
+    ]];
+    column.axis = UILayoutConstraintAxisVertical;
+    column.spacing = 6;
+    column.translatesAutoresizingMaskIntoConstraints = NO;
+    // Extra air before each caption, so the sections read as sections.
+    [column setCustomSpacing:18 afterView:self.tokenActions];
+    [column setCustomSpacing:12 afterView:self.urlLabel];
+    [column setCustomSpacing:18 afterView:self.serverActions];
+    [column setCustomSpacing:18 afterView:self.statusRow];
+    [column setCustomSpacing:14 afterView:self.serverLogView];
 
-    container.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tokenCaption.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tokenLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tokenEyeBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tokenEditBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tokenRegenBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tokenQRBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    self.restartBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    self.urlCaption.translatesAutoresizingMaskIntoConstraints = NO;
-    self.urlLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusRow.translatesAutoresizingMaskIntoConstraints = NO;
-    self.serverLogView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.logView.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.tokenQRBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [self.tokenEyeBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [self.tokenEditBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [self.tokenRegenBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [self.restartBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [self.view addSubview:column];
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
-
     [NSLayoutConstraint activateConstraints:@[
-        [container.topAnchor constraintEqualToAnchor:g.topAnchor constant:12],
-        [container.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
-        [container.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
-        [container.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12],
-
-        [self.tokenCaption.topAnchor constraintEqualToAnchor:container.topAnchor],
-        [self.tokenCaption.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-
-        [self.tokenQRBtn.topAnchor constraintEqualToAnchor:self.tokenCaption.bottomAnchor constant:4],
-        [self.tokenQRBtn.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-
-        [self.tokenRegenBtn.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
-        [self.tokenRegenBtn.trailingAnchor constraintEqualToAnchor:self.tokenQRBtn.leadingAnchor constant:-12],
-
-        [self.tokenEditBtn.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
-        [self.tokenEditBtn.trailingAnchor constraintEqualToAnchor:self.tokenRegenBtn.leadingAnchor constant:-12],
-
-        [self.tokenEyeBtn.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
-        [self.tokenEyeBtn.trailingAnchor constraintEqualToAnchor:self.tokenEditBtn.leadingAnchor constant:-12],
-
-        [self.restartBtn.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
-        [self.restartBtn.trailingAnchor constraintEqualToAnchor:self.tokenEyeBtn.leadingAnchor constant:-12],
-
-        [self.tokenLabel.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
-        [self.tokenLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [self.tokenLabel.trailingAnchor constraintEqualToAnchor:self.restartBtn.leadingAnchor constant:-8],
-
-        [self.urlCaption.topAnchor constraintEqualToAnchor:self.tokenQRBtn.bottomAnchor constant:10],
-        [self.urlCaption.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-
-        [self.urlLabel.topAnchor constraintEqualToAnchor:self.urlCaption.bottomAnchor constant:2],
-        [self.urlLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [self.urlLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-
-        [self.statusRow.topAnchor constraintEqualToAnchor:self.urlLabel.bottomAnchor constant:10],
-        [self.statusRow.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [self.statusRow.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor],
-
-        [self.serverLogView.topAnchor constraintEqualToAnchor:self.statusRow.bottomAnchor constant:10],
-        [self.serverLogView.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [self.serverLogView.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-
-        [self.logView.topAnchor constraintEqualToAnchor:self.serverLogView.bottomAnchor constant:12],
-        [self.logView.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [self.logView.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-        [self.logView.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+        [column.topAnchor constraintEqualToAnchor:g.topAnchor constant:12],
+        [column.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
+        [column.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
+        [column.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12],
 
         [self.serverLogView.heightAnchor constraintEqualToAnchor:self.logView.heightAnchor],
-        [self.serverLogView.heightAnchor constraintGreaterThanOrEqualToConstant:120],
-        [self.logView.heightAnchor constraintGreaterThanOrEqualToConstant:120],
+        [self.serverLogView.heightAnchor constraintGreaterThanOrEqualToConstant:100],
     ]];
 }
 
 #pragma mark - Log helpers
 
+// The daemon logs the public URL when it comes up, and any leak of the token
+// would land here too. Masking at render, not at write, keeps the log file on
+// the device complete while a screenshot of this screen stays postable: what
+// the labels above hide, the panes below hide as well.
+- (NSString *)censor:(NSString *)text {
+    if (self.urlHidden && self.publicURL.length)
+        text = [text stringByReplacingOccurrencesOfString:self.publicURL withString:@"••••••••"];
+    if (self.tokenHidden && self.token.length)
+        text = [text stringByReplacingOccurrencesOfString:self.token withString:@"••••••••"];
+    return text;
+}
+
+- (void)setLogText:(NSString *)text inView:(UITextView *)view {
+    view.text = [self censor:text ?: @""];
+    if (view.text.length == 0) return;
+    [view scrollRangeToVisible:NSMakeRange(view.text.length - 1, 1)];
+}
+
+// Both panes, re-rendered from what we last had. Called when a Show/Hide
+// toggle flips, so the masking changes the moment the label does.
+- (void)refreshLogViews {
+    [self setLogText:[[LSSLogger shared] snapshot] inView:self.logView];
+    [self setLogText:self.serverLogRaw inView:self.serverLogView];
+}
+
 - (void)log:(NSString *)line {
     [[LSSLogger shared] log:line tag:@"UI"];
-    self.logView.text = [[LSSLogger shared] snapshot];
-    NSRange bottom = NSMakeRange(self.logView.text.length - 1, 1);
-    [self.logView scrollRangeToVisible:bottom];
+    [self setLogText:[[LSSLogger shared] snapshot] inView:self.logView];
 }
 
 // Green when up, red when down, grey when we could not ask at all -- which is
@@ -473,9 +521,8 @@ static UIImage *QRImage(NSString *string) {
     [self.daemon getLogs:^(BOOL ok, NSString *logs) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!ok) return;
-            weakSelf.serverLogView.text = logs ?: @"";
-            NSRange bottom = NSMakeRange(weakSelf.serverLogView.text.length - 1, 1);
-            [weakSelf.serverLogView scrollRangeToVisible:bottom];
+            weakSelf.serverLogRaw = logs;
+            [weakSelf setLogText:logs inView:weakSelf.serverLogView];
             [weakSelf log:@"log polling started"];
         });
     }];
@@ -484,14 +531,14 @@ static UIImage *QRImage(NSString *string) {
 
     __block int tick = 0;
     self.logTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(__unused NSTimer *t) {
-        if (weakSelf.token.length == 0) [weakSelf fetchToken]; // daemon may start after us
+        // Daemon may start after us; the URL also shows up late, once a login lands.
+        if (weakSelf.token.length == 0 || weakSelf.publicURL.length == 0) [weakSelf fetchToken];
         if (++tick % 4 == 0) [weakSelf refreshStatus];         // liveness moves slower than logs
         [weakSelf.daemon getLogs:^(BOOL ok, NSString *logs) {
             if (!ok || !logs) return;
             dispatch_async(dispatch_get_main_queue(), ^{
-                weakSelf.serverLogView.text = logs ?: @"";
-                NSRange bottom = NSMakeRange(weakSelf.serverLogView.text.length - 1, 1);
-                [weakSelf.serverLogView scrollRangeToVisible:bottom];
+                weakSelf.serverLogRaw = logs;
+                [weakSelf setLogText:logs inView:weakSelf.serverLogView];
             });
         }];
     }];

@@ -204,8 +204,29 @@ static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOu
     return [raw substringFromIndex:sep.location + sep.length];
 }
 
+static const char *kTSCLI = "/usr/local/bin/tailscale --socket=/var/run/lss-tailscaled.socket";
+
+// Run a tailscale CLI command, logging every line it prints (stderr included --
+// that is where `up` puts the login URL) and handing each to `onLine`.
+static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
+    NSString *cmd = [NSString stringWithFormat:@"%s %@ 2>&1", kTSCLI, args];
+    FILE *p = popen(cmd.UTF8String, "r");
+    if (!p) return -1;
+
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), p)) {
+        NSString *line = [@(buf) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (line.length == 0) continue;
+        [[LSSLogger shared] log:line tag:@"TAILSCALE"];
+        if (onLine) onLine(line);
+    }
+    return pclose(p);
+}
+
 @interface LSSDaemonController ()
 @property(nonatomic, strong) LSSLocalHTTPServer *publicServer;
+@property(nonatomic, copy, nullable) NSString *cachedPublicURL;
+@property(nonatomic, copy, nullable) NSString *pendingLoginURL;
 @end
 
 @implementation LSSDaemonController
@@ -258,10 +279,10 @@ static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOu
 // cached for the life of the daemon. Re-exec if you move to a different tailnet.
 - (nullable NSString *)publicURL {
     // Cache only successes: this daemon starts before tailscaled has logged in,
-    // so the first call usually fails and must not be remembered.
-    static NSString *cached = nil;
+    // so the first call usually fails and must not be remembered. Logging in
+    // from the app clears it, since that is when the name can change.
     @synchronized (self) {
-        if (cached) return cached;
+        if (self.cachedPublicURL) return self.cachedPublicURL;
     }
 
     FILE *p = popen("/usr/local/bin/tailscale --socket=/var/run/lss-tailscaled.socket "
@@ -289,10 +310,58 @@ static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOu
 
     NSString *url = [NSString stringWithFormat:@"https://%@", name];
     @synchronized (self) {
-        cached = url;
+        self.cachedPublicURL = url;
     }
     [[LSSLogger shared] log:[NSString stringWithFormat:@"public url %@", url] tag:@"DAEMON"];
     return url;
+}
+
+// `tailscale up` prints a login URL and then blocks until the user finishes in
+// a browser, so it runs on its own queue while this call waits just long enough
+// to catch the URL. Finishing the login is what opens the Funnel.
+- (NSDictionary *)tailscaleLogin {
+    @synchronized (self) {
+        if (self.pendingLoginURL) return @{@"ok": @YES, @"loginURL": self.pendingLoginURL};
+    }
+
+    __block NSString *loginURL = nil;
+    __block NSString *lastLine = @"";
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int rc = RunTS(@"up --hostname=iphone", ^(NSString *line) {
+            lastLine = line;
+            if (loginURL || ![line hasPrefix:@"https://"]) return;
+            loginURL = line;
+            @synchronized (self) { self.pendingLoginURL = line; }
+            dispatch_semaphore_signal(done);
+        });
+        dispatch_semaphore_signal(done); // no URL printed: already logged in, or failed
+
+        @synchronized (self) { self.pendingLoginURL = nil; }
+        if (rc != 0) {
+            [[LSSLogger shared] log:[NSString stringWithFormat:@"tailscale up failed (%d)", rc] tag:@"DAEMON"];
+            return;
+        }
+
+        @synchronized (self) { self.cachedPublicURL = nil; } // name may have changed
+        RunTS([NSString stringWithFormat:@"funnel --bg %d", self.publicPort], nil);
+        [self publicURL]; // logs the URL the app is about to pick up
+    });
+
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
+
+    if (loginURL) return @{@"ok": @YES, @"loginURL": loginURL};
+    if ([self publicURL]) return @{@"ok": @YES, @"loginURL": @""}; // already logged in
+    return @{@"ok": @NO, @"loginURL": @"", @"message": lastLine.length ? lastLine : @"tailscale up gave no login link"};
+}
+
+- (NSDictionary *)tailscaleLogout {
+    int rc = RunTS(@"logout", nil);
+    @synchronized (self) { self.cachedPublicURL = nil; }
+    if (rc != 0) return @{@"ok": @NO, @"message": [NSString stringWithFormat:@"tailscale logout failed (%d)", rc]};
+    [[LSSLogger shared] log:@"logged out of tailscale" tag:@"DAEMON"];
+    return @{@"ok": @YES, @"message": @"logged out"};
 }
 
 - (NSDictionary *)daemonStatus {
@@ -304,26 +373,13 @@ static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOu
     };
 }
 
-- (NSDictionary *)applyToken:(NSString *)tok {
-    tok = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-
-    // Token travels as a URL query param, so restrict to unreserved URI chars.
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
-        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-"];
-    if (tok.length < 8 || tok.length > 128 ||
-        [tok rangeOfCharacterFromSet:[allowed invertedSet]].location != NSNotFound) {
-        return @{@"ok": @NO, @"message": @"token must be 8-128 chars of A-Za-z0-9._~-"};
-    }
-
+- (NSDictionary *)regenerateToken {
+    NSString *tok = GenerateToken();
     SaveToken(tok);
     self.setEndpointToken = tok;
     self.publicServer.authToken = tok;
-    [[LSSLogger shared] log:@"set token updated manually" tag:@"DAEMON"];
+    [[LSSLogger shared] log:@"set token regenerated" tag:@"DAEMON"];
     return @{@"ok": @YES, @"token": tok};
-}
-
-- (NSDictionary *)regenerateToken {
-    return [self applyToken:GenerateToken()];
 }
 
 - (NSString *)friendsJSON {

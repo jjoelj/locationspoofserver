@@ -14,7 +14,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// nil when tailscaled isn't running or the node isn't logged in.
 - (nullable NSString *)publicURL;
 
-- (NSDictionary *)applyToken:(NSString *)token;
+/// Start an interactive Tailscale login. Blocks until the login URL is known
+/// (~seconds) and returns @{ok, loginURL} for the app to open in Safari;
+/// loginURL is empty when the node was already logged in.
+- (NSDictionary *)tailscaleLogin;
+
+/// Log the node out of the tailnet. The public URL goes dark until someone
+/// logs in again from the app.
+- (NSDictionary *)tailscaleLogout;
 - (NSDictionary *)regenerateToken;
 - (NSString *)friendsJSON;
 - (NSString *)friendsJSONForHandle:(nullable NSString *)handle;
