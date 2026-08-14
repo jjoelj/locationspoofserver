@@ -47,6 +47,19 @@ static NSDictionary<NSString *, NSString *> *ParseQuery(NSString *query) {
     return out;
 }
 
+// Same query string, with any token value replaced. Keeps lat/lon and handle
+// visible, which is what the request log is actually for.
+static NSString *RedactToken(NSString *query) {
+    if (query.length == 0) return @"";
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *pair in [query componentsSeparatedByString:@"&"]) {
+        if (pair.length == 0) continue;
+        [parts addObject:[pair hasPrefix:@"token="] ? @"token=***" : pair];
+    }
+    return [parts componentsJoinedByString:@"&"];
+}
+
 static void WriteHTTP(int fd, int status, const char *statusText, const char *body) {
     if (!body) body = "";
     size_t bodyLen = strlen(body);
@@ -107,8 +120,6 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
     NSString *m = [NSString stringWithUTF8String:method] ?: @"";
     NSString *t = [NSString stringWithUTF8String:target] ?: @"";
 
-    [self log:[NSString stringWithFormat:@"%@ %@", m, t]];
-
     if (![m isEqualToString:@"GET"]) {
         WriteHTTP(cfd, 405, "Method Not Allowed", "use GET\n");
         close(cfd);
@@ -122,6 +133,12 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
         path = [t substringToIndex:qmark.location];
         query = [t substringFromIndex:qmark.location + 1];
     }
+
+    // Logged after the split so the token never reaches the log file or the
+    // app's log view. These logs get read over someone's shoulder and pasted
+    // into bug reports; the token is the only thing guarding /set.
+    NSString *shown = RedactToken(query);
+    [self log:[NSString stringWithFormat:@"%@ %@%@%@", m, path, shown.length ? @"?" : @"", shown]];
 
     if ([path isEqualToString:@"/"]) {
         WriteHTTP(cfd, 200, "OK", "ok\n");

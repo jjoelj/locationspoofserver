@@ -9,7 +9,7 @@
 // fill black squares into a bitmap context.
 static UIImage *QRImage(NSString *string) {
     NSData *data = [string dataUsingEncoding:NSUTF8StringEncoding];
-    uint8_t modules[29 * 29];
+    uint8_t modules[37 * 37]; // v5 max, matches LSSQRGen's ceiling
     int N = lss_qr_encode(data.bytes, (int)data.length, modules);
     if (N == 0) return nil;
 
@@ -49,7 +49,13 @@ static UIImage *QRImage(NSString *string) {
 @property(nonatomic, strong) UIButton *tokenEditBtn;
 @property(nonatomic, strong) UIButton *tokenRegenBtn;
 @property(nonatomic, strong) UIButton *tokenQRBtn;
+@property(nonatomic, strong) UIButton *restartBtn;
+@property(nonatomic, strong) UILabel *urlCaption;
+@property(nonatomic, strong) UILabel *urlLabel;
+@property(nonatomic, strong) UIStackView *statusRow;
+@property(nonatomic, strong) NSDictionary<NSString *, UILabel *> *statusLabels;
 @property(nonatomic, copy) NSString *token;
+@property(nonatomic, copy) NSString *publicURL;
 @property(nonatomic, assign) BOOL tokenHidden;
 @property(nonatomic, strong) UIImage *qrCache; // built once; math is not free
 
@@ -72,13 +78,33 @@ static UIImage *QRImage(NSString *string) {
 
 - (void)fetchToken {
     __weak typeof(self) weakSelf = self;
-    [self.daemon getToken:^(BOOL ok, NSString *token) {
+    [self.daemon getToken:^(BOOL ok, NSString *token, NSString *url) {
         dispatch_async(dispatch_get_main_queue(), ^{
             weakSelf.token = (ok && token.length) ? token : nil;
+            weakSelf.publicURL = (ok && url.length) ? url : nil;
             weakSelf.qrCache = nil; // token changed, drop cached image
             [weakSelf updateTokenDisplay];
+            [weakSelf updateURLDisplay];
         });
     }];
+}
+
+// The URL alone is not a secret: every endpoint but / needs the token, so it is
+// shown in full rather than masked like the token is.
+- (void)updateURLDisplay {
+    if (self.publicURL.length) {
+        self.urlLabel.text = self.publicURL;
+        self.urlLabel.textColor = [UIColor secondaryLabelColor];
+    } else {
+        self.urlLabel.text = @"Tailscale not connected";
+        self.urlLabel.textColor = [UIColor systemOrangeColor];
+    }
+}
+
+- (void)copyURL {
+    if (self.publicURL.length == 0) return;
+    [UIPasteboard generalPasteboard].string = self.publicURL;
+    [self log:@"public url copied"];
 }
 
 // Bullets when hidden, the value when revealed; keeps the eye icon in sync.
@@ -151,9 +177,44 @@ static UIImage *QRImage(NSString *string) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+- (void)restartDaemon {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Restart Server?"
+                                                                  message:@"Location spoofing stops until it comes back, a second or two later."
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Restart" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [weakSelf log:@"restarting server…"];
+        [weakSelf.daemon restartDaemon:^(BOOL ok, NSString *message) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!ok) {
+                    [weakSelf log:[NSString stringWithFormat:@"restart failed: %@", message]];
+                    return;
+                }
+                // launchd needs a moment to notice and respawn before we can ask
+                // it anything; the re-fetch is also how the URL gets refreshed.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    [weakSelf log:@"server restarted"];
+                    [weakSelf fetchToken];
+                });
+            });
+        }];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// One scan gives a client both where to reach us and the token to do it with.
+// Falls back to the bare token when Tailscale has not come up yet.
+- (NSString *)qrPayload {
+    if (self.publicURL.length == 0) return self.token;
+    return [NSString stringWithFormat:@"%@/?token=%@", self.publicURL, self.token];
+}
+
 - (void)showQR {
     if (self.token.length == 0) return;
-    if (!self.qrCache) self.qrCache = QRImage(self.token); // cache: encode once
+    if (!self.qrCache) self.qrCache = QRImage([self qrPayload]); // cache: encode once
     UIImage *img = self.qrCache;
     if (!img) return;
 
@@ -166,7 +227,9 @@ static UIImage *QRImage(NSString *string) {
     iv.translatesAutoresizingMaskIntoConstraints = NO;
 
     UILabel *hint = [[UILabel alloc] init];
-    hint.text = @"Scan in the Android app · tap to dismiss";
+    hint.text = self.publicURL.length
+        ? [NSString stringWithFormat:@"%@ · tap to dismiss", self.publicURL]
+        : @"Token only — Tailscale not connected · tap to dismiss";
     hint.font = [UIFont systemFontOfSize:14];
     hint.textColor = [UIColor secondaryLabelColor];
     hint.textAlignment = NSTextAlignmentCenter;
@@ -238,6 +301,43 @@ static UIImage *QRImage(NSString *string) {
 
     self.tokenQRBtn = [self makeButton:@"QR" action:@selector(showQR)];
 
+    self.urlCaption = [[UILabel alloc] init];
+    self.urlCaption.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    self.urlCaption.textColor = [UIColor tertiaryLabelColor];
+    self.urlCaption.text = @"PUBLIC URL";
+
+    self.urlLabel = [[UILabel alloc] init];
+    self.urlLabel.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    self.urlLabel.textColor = [UIColor secondaryLabelColor];
+    self.urlLabel.adjustsFontSizeToFitWidth = YES;
+    self.urlLabel.minimumScaleFactor = 0.6;
+    self.urlLabel.text = @"…";
+    self.urlLabel.userInteractionEnabled = YES;
+    [self.urlLabel addGestureRecognizer:
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(copyURL)]];
+
+    // One dot per daemon. Unknown until the first poll answers, so nothing
+    // claims to be up before we have actually asked.
+    NSMutableDictionary *labels = [NSMutableDictionary dictionary];
+    NSMutableArray *arranged = [NSMutableArray array];
+    for (NSString *name in @[@"locationspoofd", @"fmfwatchd", @"tailscaled"]) {
+        UILabel *l = [[UILabel alloc] init];
+        l.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        l.textColor = [UIColor tertiaryLabelColor];
+        l.text = [NSString stringWithFormat:@"● %@", name];
+        labels[name] = l;
+        [arranged addObject:l];
+    }
+    self.statusLabels = labels;
+    self.statusRow = [[UIStackView alloc] initWithArrangedSubviews:arranged];
+    self.statusRow.axis = UILayoutConstraintAxisHorizontal;
+    self.statusRow.distribution = UIStackViewDistributionFillProportionally;
+    self.statusRow.spacing = 10;
+
+    self.restartBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.restartBtn setImage:[UIImage systemImageNamed:@"power"] forState:UIControlStateNormal];
+    [self.restartBtn addTarget:self action:@selector(restartDaemon) forControlEvents:UIControlEventTouchUpInside];
+
     self.serverLogView = [[UITextView alloc] init];
     self.serverLogView.editable = NO;
     self.serverLogView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
@@ -260,6 +360,10 @@ static UIImage *QRImage(NSString *string) {
     [container addSubview:self.tokenEditBtn];
     [container addSubview:self.tokenRegenBtn];
     [container addSubview:self.tokenQRBtn];
+    [container addSubview:self.restartBtn];
+    [container addSubview:self.urlCaption];
+    [container addSubview:self.urlLabel];
+    [container addSubview:self.statusRow];
     [container addSubview:self.serverLogView];
     [container addSubview:self.logView];
 
@@ -270,12 +374,17 @@ static UIImage *QRImage(NSString *string) {
     self.tokenEditBtn.translatesAutoresizingMaskIntoConstraints = NO;
     self.tokenRegenBtn.translatesAutoresizingMaskIntoConstraints = NO;
     self.tokenQRBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.restartBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.urlCaption.translatesAutoresizingMaskIntoConstraints = NO;
+    self.urlLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusRow.translatesAutoresizingMaskIntoConstraints = NO;
     self.serverLogView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.tokenQRBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self.tokenEyeBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self.tokenEditBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self.tokenRegenBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [self.restartBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
 
     [NSLayoutConstraint activateConstraints:@[
@@ -299,11 +408,25 @@ static UIImage *QRImage(NSString *string) {
         [self.tokenEyeBtn.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
         [self.tokenEyeBtn.trailingAnchor constraintEqualToAnchor:self.tokenEditBtn.leadingAnchor constant:-12],
 
+        [self.restartBtn.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
+        [self.restartBtn.trailingAnchor constraintEqualToAnchor:self.tokenEyeBtn.leadingAnchor constant:-12],
+
         [self.tokenLabel.centerYAnchor constraintEqualToAnchor:self.tokenQRBtn.centerYAnchor],
         [self.tokenLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [self.tokenLabel.trailingAnchor constraintEqualToAnchor:self.tokenEyeBtn.leadingAnchor constant:-8],
+        [self.tokenLabel.trailingAnchor constraintEqualToAnchor:self.restartBtn.leadingAnchor constant:-8],
 
-        [self.serverLogView.topAnchor constraintEqualToAnchor:self.tokenQRBtn.bottomAnchor constant:12],
+        [self.urlCaption.topAnchor constraintEqualToAnchor:self.tokenQRBtn.bottomAnchor constant:10],
+        [self.urlCaption.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+
+        [self.urlLabel.topAnchor constraintEqualToAnchor:self.urlCaption.bottomAnchor constant:2],
+        [self.urlLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [self.urlLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+
+        [self.statusRow.topAnchor constraintEqualToAnchor:self.urlLabel.bottomAnchor constant:10],
+        [self.statusRow.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [self.statusRow.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor],
+
+        [self.serverLogView.topAnchor constraintEqualToAnchor:self.statusRow.bottomAnchor constant:10],
         [self.serverLogView.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
         [self.serverLogView.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
 
@@ -327,6 +450,24 @@ static UIImage *QRImage(NSString *string) {
     [self.logView scrollRangeToVisible:bottom];
 }
 
+// Green when up, red when down, grey when we could not ask at all -- which is
+// itself the answer for locationspoofd, since it serves this very endpoint.
+- (void)refreshStatus {
+    __weak typeof(self) weakSelf = self;
+    [self.daemon getStatus:^(BOOL ok, NSDictionary *daemons) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf.statusLabels enumerateKeysAndObjectsUsingBlock:^(NSString *name, UILabel *l, __unused BOOL *stop) {
+                if (!ok) {
+                    l.textColor = [UIColor tertiaryLabelColor];
+                    return;
+                }
+                BOOL up = [daemons[name] boolValue];
+                l.textColor = up ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+            }];
+        });
+    }];
+}
+
 - (void)startLogPolling {
     __weak typeof(self) weakSelf = self;
     [self.daemon getLogs:^(BOOL ok, NSString *logs) {
@@ -339,8 +480,12 @@ static UIImage *QRImage(NSString *string) {
         });
     }];
 
+    [self refreshStatus];
+
+    __block int tick = 0;
     self.logTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(__unused NSTimer *t) {
         if (weakSelf.token.length == 0) [weakSelf fetchToken]; // daemon may start after us
+        if (++tick % 4 == 0) [weakSelf refreshStatus];         // liveness moves slower than logs
         [weakSelf.daemon getLogs:^(BOOL ok, NSString *logs) {
             if (!ok || !logs) return;
             dispatch_async(dispatch_get_main_queue(), ^{

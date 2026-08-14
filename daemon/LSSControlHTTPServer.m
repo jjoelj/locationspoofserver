@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 @interface LSSControlHTTPServer ()
 @property(nonatomic, assign) int listenFD;
@@ -176,8 +177,27 @@ static NSData *ReadExact(int fd, size_t n) {
     }
 
     if ([method isEqualToString:@"GET"] && [path isEqualToString:@"/token"]) {
-        WriteJSON(cfd, 200, @{@"ok": @YES, @"token": dc.setEndpointToken ?: @""});
+        WriteJSON(cfd, 200, @{@"ok": @YES,
+                              @"token": dc.setEndpointToken ?: @"",
+                              @"url": [dc publicURL] ?: @""});
         close(cfd);
+        return;
+    }
+
+    if ([method isEqualToString:@"GET"] && [path isEqualToString:@"/status"]) {
+        WriteJSON(cfd, 200, @{@"ok": @YES, @"daemons": [dc daemonStatus]});
+        close(cfd);
+        return;
+    }
+
+    // Exiting is the whole restart: launchd's KeepAlive brings us straight back.
+    // Delayed so this response reaches the app before the socket dies with us.
+    if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/restart"]) {
+        WriteJSON(cfd, 200, @{@"ok": @YES, @"message": @"restarting"});
+        close(cfd);
+        [[LSSLogger shared] log:@"restart requested from app" tag:@"DAEMON"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ exit(0); });
         return;
     }
 

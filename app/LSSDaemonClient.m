@@ -37,14 +37,27 @@
     }];
 }
 
-- (void)getToken:(void (^)(BOOL ok, NSString *token))completion {
+- (void)getStatus:(void (^)(BOOL ok, NSDictionary *daemons))completion {
+    [self request:@"/status" method:@"GET" json:nil completion:^(BOOL ok, NSDictionary *resp) {
+        NSDictionary *d = [resp[@"daemons"] isKindOfClass:[NSDictionary class]] ? resp[@"daemons"] : @{};
+        completion(ok, d);
+    }];
+}
+
+- (void)getToken:(void (^)(BOOL ok, NSString *token, NSString *url))completion {
     [self request:@"/token" method:@"GET" json:nil completion:^(BOOL ok, NSDictionary *resp) {
-        completion(ok, resp[@"token"] ?: @"");
+        completion(ok, resp[@"token"] ?: @"", resp[@"url"] ?: @"");
     }];
 }
 
 - (void)setToken:(NSString *)token completion:(void (^)(BOOL ok, NSString *message))completion {
     [self request:@"/token" method:@"POST" json:@{@"token": token} completion:^(BOOL ok, NSDictionary *resp) {
+        completion(ok, resp[@"message"] ?: @"");
+    }];
+}
+
+- (void)restartDaemon:(void (^)(BOOL ok, NSString *message))completion {
+    [self request:@"/restart" method:@"POST" json:@{} completion:^(BOOL ok, NSDictionary *resp) {
         completion(ok, resp[@"message"] ?: @"");
     }];
 }

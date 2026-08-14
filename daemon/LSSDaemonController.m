@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -114,6 +115,39 @@ static NSDictionary *ReadBatteryStatus(void) {
     return battery ?: @{@"ok": @NO, @"message": @"battery not found"};
 }
 
+// Liveness by connecting, not by scanning the process table: a daemon that is
+// running but not accepting connections is not useful to anyone here.
+static BOOL TCPPortOpen(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NO;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    BOOL ok = connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(fd);
+    return ok;
+}
+
+static BOOL UnixSocketAlive(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return NO;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
+
+    // A stale socket file left by a dead daemon refuses the connection, which
+    // is exactly the distinction we want.
+    BOOL ok = connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(fd);
+    return ok;
+}
+
 static NSString *URLEncode(NSString *s) {
     NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
         @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-"];
@@ -217,6 +251,57 @@ static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOu
 
     [self.publicServer startOnPort:self.publicPort];
     [[LSSLogger shared] log:[NSString stringWithFormat:@"public server on 127.0.0.1:%d", self.publicPort] tag:@"DAEMON"];
+}
+
+// Shell out to the tailscale CLI instead of speaking to tailscaled's
+// local API ourselves. One process spawn per call until it succeeds, then
+// cached for the life of the daemon. Re-exec if you move to a different tailnet.
+- (nullable NSString *)publicURL {
+    // Cache only successes: this daemon starts before tailscaled has logged in,
+    // so the first call usually fails and must not be remembered.
+    static NSString *cached = nil;
+    @synchronized (self) {
+        if (cached) return cached;
+    }
+
+    FILE *p = popen("/usr/local/bin/tailscale --socket=/var/run/lss-tailscaled.socket "
+                    "status --json 2>/dev/null", "r");
+    if (!p) return nil;
+
+    NSMutableData *out = [NSMutableData data];
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) [out appendBytes:buf length:n];
+    if (pclose(p) != 0 || out.length == 0) {
+        [[LSSLogger shared] log:@"tailscale status unavailable" tag:@"DAEMON"];
+        return nil;
+    }
+
+    NSDictionary *st = [NSJSONSerialization JSONObjectWithData:out options:0 error:nil];
+    if (![st isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *me = st[@"Self"];
+    if (![me isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSString *name = me[@"DNSName"];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) return nil;
+    // DNSName comes back fully qualified, with the trailing root dot.
+    if ([name hasSuffix:@"."]) name = [name substringToIndex:name.length - 1];
+
+    NSString *url = [NSString stringWithFormat:@"https://%@", name];
+    @synchronized (self) {
+        cached = url;
+    }
+    [[LSSLogger shared] log:[NSString stringWithFormat:@"public url %@", url] tag:@"DAEMON"];
+    return url;
+}
+
+- (NSDictionary *)daemonStatus {
+    return @{
+        // We are answering this request, so we are up by definition.
+        @"locationspoofd": @YES,
+        @"fmfwatchd": @(TCPPortOpen((uint16_t)kFMFWatchPort)),
+        @"tailscaled": @(UnixSocketAlive("/var/run/lss-tailscaled.socket")),
+    };
 }
 
 - (NSDictionary *)applyToken:(NSString *)tok {
