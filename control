@@ -1,6 +1,6 @@
 Package: io.github.jjoelj.locationspoofserver
 Name: Location Spoof Server
-Version: 0.0.1
+Version: 0.1.0
 Architecture: iphoneos-arm
 Description: An awesome application!
 Maintainer: Joel Jothiprakasam
