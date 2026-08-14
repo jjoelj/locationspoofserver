@@ -4,4 +4,7 @@ echo "Killing locationd..."
 
 killall -9 locationd || true
 
+# Holds the node's private key, so keep it root-only.
+mkdir -p -m 700 /var/lib/tailscale
+
 exit 0

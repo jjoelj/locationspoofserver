@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.jjoelj.tailscaled</string>
+
+  <key>POSIXSpawnType</key>
+  <string>Interactive</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>SessionCreate</key>
+  <true/>
+
+  <!-- Not tailscaled directly; launchd cannot spawn it. See daemon/tsboot_main.c,
+       which also holds tailscaled's flags. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/libexec/tsboot</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/tailscaled.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/tailscaled.log</string>
+</dict>
+</plist>
