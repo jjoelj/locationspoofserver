@@ -55,7 +55,7 @@ jobs:
             theos/toolchain
             theos/sdks
             ~/go/pkg/mod
-          key: theos-${{ env.TOOLCHAIN_RELEASE }}-${{ env.SDKS_RELEASE }}-${{ env.SDK }}-${{ hashFiles('Makefile') }}
+          key: theos-${{ env.TOOLCHAIN_RELEASE }}-${{ env.SDKS_RELEASE }}-${{ env.SDK }}
 
       - name: Fetch iOS toolchain and SDK
         if: steps.cache.outputs.cache-hit != 'true'
@@ -90,8 +90,11 @@ jobs:
 
       # PACKAGE_VERSION suppresses Theos's build counter, which resets to 1 on a
       # fresh checkout and would hand Sileo a version that goes backwards.
+      # THEOS_USE_PARALLEL_BUILDING=0 because every target shares one clang
+      # module cache: built in parallel, two of them race on the same .pcm and
+      # the build dies with "signature mismatch" perhaps one run in two.
       - name: Build package
-        run: make package FINALPACKAGE=1 PACKAGE_VERSION=${{ steps.ver.outputs.version }}
+        run: make package FINALPACKAGE=1 THEOS_USE_PARALLEL_BUILDING=0 PACKAGE_VERSION=${{ steps.ver.outputs.version }}
 
       # An APT repo is just the .deb, a Packages index describing it, and a
       # Release naming the source.
