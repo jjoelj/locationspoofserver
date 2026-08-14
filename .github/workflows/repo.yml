@@ -103,15 +103,21 @@ jobs:
           cd _site
           dpkg-scanpackages -m debs /dev/null > Packages
           gzip -9kf Packages
+          bzip2 -9kf Packages
           # ponytail: no hashes in Release, no GPG signature. Sileo and Zebra
           # check neither over HTTPS; add both if apt(8) ever needs to trust it.
-          # Suite/Codename/Components are left out on purpose: they address one
-          # dist inside a multi-dist archive, and this repo is flat (deb URL ./).
+          # The dist fields below are unused by a flat repo, but Sileo wants a
+          # Release that looks like every other repo's, so they stay.
           cat > Release <<EOF
           Origin: jjoelj
           Label: jjoelj
+          Suite: stable
+          Version: 1.0
+          Codename: ios
           Architectures: iphoneos-arm
+          Components: main
           Description: Tweaks and tools by jjoelj
+          Date: $(date -uR)
           EOF
           cat > index.html <<EOF
           <title>jjoelj's repo</title>
