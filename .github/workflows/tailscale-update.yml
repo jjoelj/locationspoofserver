@@ -1,0 +1,47 @@
+# Weekly: if Tailscale shipped a new stable, bump it, bump the package version,
+# tag, and release. repo.yml does the actual build and publish.
+name: Update bundled Tailscale
+
+on:
+  schedule: [{cron: '17 6 * * 1'}]   # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write        # to dispatch repo.yml
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bump, tag, release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # pkgs.tailscale.com, not the GitHub release list: only this one says
+          # which build is the stable channel.
+          ts=v$(curl -fsSL 'https://pkgs.tailscale.com/stable/?mode=json' | jq -r .TarballsVersion)
+          old=$(grep -oP '^TAILSCALE_VERSION = \K.*' Makefile)
+          [[ "$ts" =~ ^v[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::bad Tailscale version '$ts'"; exit 1; }
+          [[ "$ts" != "$old" ]] || { echo "already on $old"; exit 0; }
+
+          # A new Tailscale is a new package, so control moves too: repo.yml
+          # refuses to build a tag that disagrees with it.
+          pkg=$(grep -oP '^Version: \K.*' control | tr -d '[:space:]')
+          [[ "$pkg" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::can't patch-bump Version: $pkg"; exit 1; }
+          new_pkg=${pkg%.*}.$(( ${pkg##*.} + 1 ))
+
+          sed -i "s/^TAILSCALE_VERSION = .*/TAILSCALE_VERSION = $ts/" Makefile
+          sed -i "s/^Version: .*/Version: $new_pkg/" control
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git commit -am "bundle Tailscale $ts"
+          git tag "v$new_pkg"
+          git push origin HEAD "v$new_pkg"
+
+          # A tag pushed with GITHUB_TOKEN triggers nothing; workflow_dispatch
+          # is one of the two events GitHub exempts from that rule.
+          gh workflow run repo.yml --ref "v$new_pkg"

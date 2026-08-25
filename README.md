@@ -155,6 +155,12 @@ Upgrades then arrive on the phone like any other package.
    (`theos/sdks`). Both are the same artefacts `install-theos` fetches for a
    local setup, pinned by release tag in the workflow's `env:` block, and
    cached on that pin. Bump the pins by hand when you want newer ones.
+   `TAILSCALE_VERSION` in the Makefile is the exception:
+   `.github/workflows/tailscale-update.yml` checks weekly, and on a new stable
+   release bumps it, patch-bumps `Version:` in `control`, tags, and dispatches
+   this workflow at the tag — so a Tailscale update ships as an ordinary
+   release. If the build breaks, the run fails and the published repo keeps
+   serving the previous .deb; fix it and tag again.
 3. **Build** with `FINALPACKAGE=1` and `PACKAGE_VERSION=` the version from
    `control`. The override matters even though it repeats `control`: Theos
    otherwise appends its own build counter, which restarts at 1 on a fresh
