@@ -1,0 +1,45 @@
+# The only thing that moves main. Run it by hand when dev is worth shipping:
+# main fast-forwards to dev, the tag goes on, and repo.yml builds and publishes.
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write        # to dispatch repo.yml
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0    # pushing main from a shallow clone is rejected
+
+      - name: Fast-forward main and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver=$(grep -oP '^Version: \K.*' control | tr -d '[:space:]')
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad Version: $ver in control"; exit 1; }
+          if git ls-remote --exit-code --tags origin "v$ver" >/dev/null; then
+            echo "::error::v$ver is already released. Bump Version: in control on dev."
+            exit 1
+          fi
+
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          # Fast-forward only. Rejected means main moved without dev — a
+          # Tailscale bump, most likely: merge main into dev and run again.
+          git push origin HEAD:main
+          git tag "v$ver"
+          git push origin "v$ver"
+
+          # The tag was pushed with GITHUB_TOKEN, so it triggers nothing;
+          # workflow_dispatch is one of the two events GitHub exempts. Run it on
+          # main so its caches are readable by the next release.
+          gh workflow run repo.yml --ref main -f tag="v$ver"
+          echo "Released v$ver" >> "$GITHUB_STEP_SUMMARY"

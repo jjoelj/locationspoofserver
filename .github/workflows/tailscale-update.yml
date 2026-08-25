@@ -1,5 +1,6 @@
-# Weekly: if Tailscale shipped a new stable, bump it, bump the package version,
-# tag, and release. repo.yml does the actual build and publish.
+# Weekly: if Tailscale shipped a new stable, release it. The bump is made on
+# main, the released state, so it ships on its own and never drags unfinished
+# dev work out with it. Merging it back into dev is a manual chore.
 name: Update bundled Tailscale
 
 on:
@@ -15,6 +16,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: main
 
       - name: Bump, tag, release
         env:
@@ -40,8 +43,11 @@ jobs:
           git config user.email github-actions@github.com
           git commit -am "bundle Tailscale $ts"
           git tag "v$new_pkg"
-          git push origin HEAD "v$new_pkg"
+          git push origin HEAD:main "v$new_pkg"
 
           # A tag pushed with GITHUB_TOKEN triggers nothing; workflow_dispatch
-          # is one of the two events GitHub exempts from that rule.
-          gh workflow run repo.yml --ref "v$new_pkg"
+          # is one of the two events GitHub exempts from that rule. Dispatched
+          # on main so the run's caches are readable by the next release.
+          gh workflow run repo.yml --ref main -f tag="v$new_pkg"
+          echo "Released v$new_pkg with Tailscale $ts" >> "$GITHUB_STEP_SUMMARY"
+

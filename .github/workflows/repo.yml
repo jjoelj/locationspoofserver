@@ -7,16 +7,25 @@ on:
   push:
     tags: ['v*']       # must match Version: in control
   workflow_dispatch:   # manual run -> 0.1.0~ci<n>; ~ sorts below the release
+    inputs:
+      # Releases are dispatched on main, not on the tag: Actions caches are
+      # scoped by ref, and only runs on the default branch write caches the
+      # next release can read. This is how such a run knows it is a release.
+      tag:
+        description: 'Release version to build as (empty = ~ci version)'
+        required: false
 
 permissions:
   contents: read
   pages: write         # deploy-pages needs these two
   id-token: write
 
-# A half-written repo index is worse than a late one.
+# One publisher at a time, newest wins: if a release is dispatched while an
+# older one is still building, the older is superseded, and killing it before
+# it deploys is the point. Pages keeps the last good version either way.
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   THEOS: ${{ github.workspace }}/theos
@@ -70,15 +79,30 @@ jobs:
           curl -fsSL "https://github.com/theos/sdks/releases/download/$SDKS_RELEASE/$SDK.tar.xz" \
             | tar -xJf - -C "$THEOS/sdks"
 
+      # The Makefile only builds these if they are missing, so restoring them
+      # skips the Go build, the Mach-O patch and the signing entirely. Keyed on
+      # the version it would build and on the patcher that produced them.
+      - name: Read Tailscale version
+        id: ts
+        run: grep -oP '^TAILSCALE_VERSION = \K.*' Makefile | sed 's/^/version=/' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: layout/usr/local/bin
+          key: tailscale-${{ steps.ts.outputs.version }}-${{ hashFiles('tools/ios_platform.py') }}
+
       # control is the one place the version lives; a tag only says "ship it",
       # and disagreeing with control fails here rather than on someone's phone.
       - name: Decide package version
         id: ver
+        env:
+          TAG: ${{ inputs.tag }}     # via env, never interpolated into the script
         run: |
           set -euo pipefail
           base=$(grep -i '^Version:' control | cut -d' ' -f2- | tr -d '[:space:]')
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tag=${GITHUB_REF#refs/tags/v}
+          ref=${TAG:-$GITHUB_REF}
+          if [[ "$ref" == v* || "$ref" == refs/tags/v* ]]; then
+            tag=${ref#refs/tags/}; tag=${tag#v}
             if [[ "$tag" != "$base" ]]; then
               echo "::error::tag v$tag does not match Version: $base in control. Bump control first."
               exit 1

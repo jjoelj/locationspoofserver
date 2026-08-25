@@ -137,14 +137,17 @@ Upgrades are left alone: your login and token survive them.
 
 ## Releases
 
-The version lives in `control`, and nowhere else. Bump it there, then tag the
-commit to build and publish:
+Work lands on `dev`. `main` is what has shipped: nothing writes it except the
+**Release** workflow, run by hand from the Actions tab when `dev` is worth
+shipping, and the weekly Tailscale bump below. It fast-forwards `main` to `dev`, tags `v` + whatever `Version:` in
+`control` says, and starts the build. Bump `control` on `dev` first — releasing
+a version that is already tagged fails instead of shipping.
+
+Tagging by hand still works, and still has to agree with `control`:
 
 ```sh
 git tag v0.2.0 && git push origin v0.2.0   # must match Version: 0.2.0 in control
 ```
-
-A tag that disagrees with `control` fails the build instead of shipping.
 
 Upgrades then arrive on the phone like any other package.
 `.github/workflows/repo.yml` does it in one job:
@@ -156,11 +159,13 @@ Upgrades then arrive on the phone like any other package.
    local setup, pinned by release tag in the workflow's `env:` block, and
    cached on that pin. Bump the pins by hand when you want newer ones.
    `TAILSCALE_VERSION` in the Makefile is the exception:
-   `.github/workflows/tailscale-update.yml` checks weekly, and on a new stable
-   release bumps it, patch-bumps `Version:` in `control`, tags, and dispatches
-   this workflow at the tag — so a Tailscale update ships as an ordinary
-   release. If the build breaks, the run fails and the published repo keeps
-   serving the previous .deb; fix it and tag again.
+   `.github/workflows/tailscale-update.yml` checks weekly and, on a new stable
+   release, bumps it and `Version:` in `control`, tags, and ships — the one
+   thing besides **Release** that writes `main`. It commits on top of `main`,
+   not `dev`, so a Tailscale update never carries unfinished work with it. Merge
+   `main` into `dev` yourself afterwards, or the next **Release** run is
+   rejected for not being a fast-forward. The built binaries are cached on that
+   version, so releases that do not move it skip the Go build entirely.
 3. **Build** with `FINALPACKAGE=1` and `PACKAGE_VERSION=` the version from
    `control`. The override matters even though it repeats `control`: Theos
    otherwise appends its own build counter, which restarts at 1 on a fresh
