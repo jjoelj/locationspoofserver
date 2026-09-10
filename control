@@ -1,6 +1,6 @@
 Package: io.github.jjoelj.locationspoofserver
 Name: Location Spoof Server
-Version: 0.2.1
+Version: 0.3.0
 Architecture: iphoneos-arm
 Description: HTTP server that sets the device's simulated location, and reports battery and Find My friends. Reachable from anywhere over Tailscale Funnel.
 Maintainer: Joel Jothiprakasam
