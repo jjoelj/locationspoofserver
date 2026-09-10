@@ -26,6 +26,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString *)friendsJSON;
 - (NSString *)friendsJSONForHandle:(nullable NSString *)handle;
 - (NSString *)refreshFriendsJSONForHandle:(nullable NSString *)handle ifStarted:(BOOL *)started;
+/// Handles that can currently see my location.
+- (NSString *)followingJSON;
+/// Start or stop sharing my location with `handle`. hours nil shares
+/// indefinitely; the recipient is notified either way.
+- (NSString *)sharingJSONForHandle:(NSString *)handle share:(BOOL)share hours:(nullable NSString *)hours;
 - (NSDictionary *)batteryStatus;
 /// Liveness of each daemon in the package, keyed by name.
 - (NSDictionary *)daemonStatus;

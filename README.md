@@ -223,11 +223,21 @@ device; there is no way to set one by hand.
 | `GET /set?lat=..&lon=..&token=..` | Sets the simulated location |
 | `GET /friends?token=..` | Cached Find My friend locations |
 | `GET /friends/refresh?token=..` | Same, forcing a fresh fetch first |
+| `GET /following?token=..` | Handles that can see *my* location right now |
+| `GET /share?handle=..&token=..` | Start sharing my location with that handle. `&hours=N` to expire it |
+| `GET /unshare?handle=..&token=..` | Stop sharing my location with that handle |
 | `GET /battery?token=..` | Battery level and charging state |
 
 ```sh
 curl "https://iphone.<tailnet>.ts.net/set?lat=37.7749&lon=-122.4194&token=$TOKEN"
+curl "https://iphone.<tailnet>.ts.net/share?handle=friend@example.com&hours=1&token=$TOKEN"
 ```
+
+`handle` is an Apple ID email or a phone number, exactly as `/friends` and
+`/following` report it. Sharing and unsharing both notify the other person, the
+same as doing it in Find My. Both answer with the follower list as fmfd sees it
+straight afterwards, so `sharing` in the response is the state that actually
+took, not just an acknowledgement that the request was sent.
 
 The token travels in the query string, so it will appear in the logs of
 anything between you and the phone. Regenerate it from the app if you think it

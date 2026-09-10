@@ -190,6 +190,40 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
         return;
     }
 
+    if ([path isEqualToString:@"/following"] ||
+        [path isEqualToString:@"/share"] ||
+        [path isEqualToString:@"/unshare"]) {
+        NSDictionary *q = ParseQuery(query);
+        if (!TokenOK(q[@"token"], self.authToken)) {
+            WriteHTTP(cfd, 403, "Forbidden", "invalid or missing token\n");
+            close(cfd);
+            return;
+        }
+
+        NSString *json;
+        NSString *handle = q[@"handle"];
+        if ([path isEqualToString:@"/following"]) {
+            json = [[LSSDaemonController shared] followingJSON];
+        } else if (handle.length == 0) {
+            WriteHTTP(cfd, 400, "Bad Request", "missing handle. use /share?handle=..\n");
+            close(cfd);
+            return;
+        } else if (q[@"hours"] && [q[@"hours"] doubleValue] <= 0) {
+            // Unparseable hours would otherwise read as 0 and share for zero
+            // seconds, which looks identical to a share that silently failed.
+            WriteHTTP(cfd, 400, "Bad Request", "hours must be a positive number\n");
+            close(cfd);
+            return;
+        } else {
+            json = [[LSSDaemonController shared] sharingJSONForHandle:handle
+                                                                share:[path isEqualToString:@"/share"]
+                                                                hours:q[@"hours"]];
+        }
+        WriteJSONBody(cfd, 200, "OK", json);
+        close(cfd);
+        return;
+    }
+
     if ([path isEqualToString:@"/battery"]) {
         NSDictionary *q = ParseQuery(query);
         if (!TokenOK(q[@"token"], self.authToken)) {

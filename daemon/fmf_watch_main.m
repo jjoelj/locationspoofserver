@@ -21,6 +21,7 @@ static const NSTimeInterval kRunLoopStep = 0.2;
 static const NSTimeInterval kAutoRefreshAge = 10 * 60;
 static const NSTimeInterval kAutoRefreshMinInterval = 5 * 60;
 static const NSTimeInterval kAutoRefreshTick = 5 * 60;
+static const NSTimeInterval kShareDeadline = 20.0;
 
 @interface FMFLocation : NSObject
 @property(nonatomic) CLLocationCoordinate2D coordinate;
@@ -46,6 +47,9 @@ static const NSTimeInterval kAutoRefreshTick = 5 * 60;
 - (void)refreshLocationForHandle:(id)h callerId:(id)callerId priority:(long long)priority completion:(id)completion;
 - (void)refreshLocationForHandles:(id)handles callerId:(id)callerId priority:(long long)priority completion:(id)completion;
 - (void)getHandlesSharingLocationsWithMeWithGroupId:(id)g completion:(void (^)(NSArray *))c;
+- (void)getHandlesFollowingMyLocationWithGroupId:(id)g completion:(void (^)(NSArray *))c;
+- (void)sendFriendshipOfferToHandle:(id)h groupId:(id)g callerId:(id)c endDate:(NSDate *)e completion:(id)completion;
+- (void)stopSharingMyLocationWithHandle:(id)h groupId:(id)g callerId:(id)c completion:(id)completion;
 @end
 
 static NSMutableDictionary<NSString *, FMFLocation *> *gLatest;
@@ -500,6 +504,69 @@ static NSString *FriendsJSON(NSString *handle) {
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"{\"ok\":false,\"message\":\"json encode failed\"}";
 }
 
+// --- Sharing my own location -------------------------------------------
+// fmfd's XPC completion blocks are declared as bare "some block" in the
+// protocol, so their argument shapes are guesswork -- reading them wrong means
+// dereferencing a BOOL as a pointer. We take a no-arg block (extra arguments
+// are harmless on arm64) and confirm the result by re-reading the follower
+// list instead of trusting a completion we cannot type.
+
+static NSArray<NSString *> *StringIds(id ids) {
+    id v = [ids respondsToSelector:@selector(allObjects)] ? [ids allObjects] : ids;
+    if (![v respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (id x in v) {
+        NSString *s = [x isKindOfClass:NSString.class] ? x : [x description];
+        if (s.length) [out addObject:s];
+    }
+    return [out sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// Handles that can see my location right now. nil if fmfd did not answer.
+static NSArray<NSString *> *FollowingMyLocation(void) {
+    __block NSArray<NSString *> *out = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [gSession getHandlesFollowingMyLocationWithGroupId:nil completion:^(NSArray *ids) {
+        out = StringIds(ids);
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kShareDeadline * NSEC_PER_SEC)));
+    return out;
+}
+
+static NSDictionary *FollowingJSONObject(void) {
+    NSArray *following = FollowingMyLocation();
+    if (!following) return @{@"ok": @NO, @"message": @"fmfd did not answer"};
+    return @{@"ok": @YES, @"following": following};
+}
+
+// share=YES sends a "Share My Location" offer (the recipient is notified and
+// can see me from then on); share=NO revokes it. endDate nil shares
+// indefinitely, matching Find My's "Share Indefinitely".
+static NSDictionary *SetSharing(NSString *hid, BOOL share, NSDate *endDate) {
+    if (!hid.length) return @{@"ok": @NO, @"message": @"missing handle"};
+    FMFHandle *h = [gHandleCls handleWithId:hid];
+    if (!h) return @{@"ok": @NO, @"message": @"bad handle"};
+
+    Log([NSString stringWithFormat:@"watch %@ handle=%@ until=%@",
+        share ? @"share" : @"unshare", hid, endDate ?: @"never"]);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    id done = ^{ dispatch_semaphore_signal(sem); };
+    if (share) {
+        [gSession sendFriendshipOfferToHandle:h groupId:nil callerId:nil endDate:endDate completion:done];
+    } else {
+        [gSession stopSharingMyLocationWithHandle:h groupId:nil callerId:nil completion:done];
+    }
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kShareDeadline * NSEC_PER_SEC)));
+
+    NSArray *following = FollowingMyLocation();
+    BOOL sharing = [following containsObject:hid];
+    Log([NSString stringWithFormat:@"watch %@ done handle=%@ sharing=%d",
+        share ? @"share" : @"unshare", hid, sharing]);
+    return @{@"ok": @YES, @"handle": hid, @"sharing": @(sharing), @"following": following ?: @[]};
+}
+
 // Kicks off a background bulk refresh (non-blocking) if any known friend's
 // fix is missing or older than kAutoRefreshAge, rate-limited so reads don't
 // pile refreshes on top of each other.
@@ -616,6 +683,21 @@ static void HandleClient(int cfd) {
             BOOL conflict = [refresh[@"message"] isEqualToString:@"friends refresh already in progress"];
             WriteHTTP(cfd, conflict ? 409 : 200, body);
         }
+    } else if ([path isEqualToString:@"/following"] ||
+               [path isEqualToString:@"/share"] ||
+               [path isEqualToString:@"/unshare"]) {
+        NSDictionary *result;
+        if ([path isEqualToString:@"/following"]) {
+            result = FollowingJSONObject();
+        } else {
+            double hours = [q[@"hours"] doubleValue];
+            NSDate *endDate = hours > 0 ?
+                [NSDate dateWithTimeIntervalSinceNow:hours * 3600] : nil;
+            result = SetSharing(q[@"handle"], [path isEqualToString:@"/share"], endDate);
+        }
+        NSData *data = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
+        NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"{\"ok\":false}";
+        WriteHTTP(cfd, [result[@"ok"] boolValue] ? 200 : 400, body);
     } else {
         WriteHTTP(cfd, 404, @"{\"ok\":false,\"message\":\"not found\"}");
     }

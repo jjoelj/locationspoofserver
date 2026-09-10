@@ -154,7 +154,7 @@ static NSString *URLEncode(NSString *s) {
     return [s stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: @"";
 }
 
-static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOut) {
+static NSString *FMFWatchRequest(NSString *path, NSDictionary<NSString *, NSString *> *params, int *statusOut) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         if (statusOut) *statusOut = 0;
@@ -174,9 +174,12 @@ static NSString *FMFWatchRequest(NSString *path, NSString *handle, int *statusOu
     }
 
     NSString *target = path;
-    if (handle.length) {
-        target = [target stringByAppendingFormat:@"?handle=%@", URLEncode(handle)];
+    NSMutableArray *pairs = [NSMutableArray array];
+    for (NSString *k in params) {
+        NSString *v = params[k];
+        if (v.length) [pairs addObject:[NSString stringWithFormat:@"%@=%@", k, URLEncode(v)]];
     }
+    if (pairs.count) target = [target stringByAppendingFormat:@"?%@", [pairs componentsJoinedByString:@"&"]];
     NSString *req = [NSString stringWithFormat:
         @"GET %@ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", target];
     NSData *reqData = [req dataUsingEncoding:NSUTF8StringEncoding];
@@ -387,7 +390,7 @@ static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
 }
 
 - (NSString *)friendsJSONForHandle:(NSString *)handle {
-    return FMFWatchRequest(@"/friends", handle, NULL);
+    return FMFWatchRequest(@"/friends", handle.length ? @{@"handle": handle} : nil, NULL);
 }
 
 - (NSString *)refreshFriendsJSONForHandle:(NSString *)handle ifStarted:(BOOL *)started {
@@ -395,11 +398,24 @@ static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
     NSString *target = handle.length ? [NSString stringWithFormat:@" for handle=%@", handle] : @"";
     [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh started%@", target] tag:@"FMF"];
     int status = 0;
-    NSString *json = FMFWatchRequest(@"/refresh", handle, &status);
+    NSString *json = FMFWatchRequest(@"/refresh", handle.length ? @{@"handle": handle} : nil, &status);
     if (started) *started = (status != 409);
     NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:start];
     [[LSSLogger shared] log:[NSString stringWithFormat:@"friends refresh finished in %.1fs (%@)", elapsed, FriendsSummary(json)] tag:@"FMF"];
     return json;
+}
+
+- (NSString *)followingJSON {
+    return FMFWatchRequest(@"/following", nil, NULL);
+}
+
+- (NSString *)sharingJSONForHandle:(NSString *)handle share:(BOOL)share hours:(NSString *)hours {
+    NSMutableDictionary *params = [NSMutableDictionary dictionary];
+    if (handle.length) params[@"handle"] = handle;
+    if (hours.length) params[@"hours"] = hours;
+    [[LSSLogger shared] log:[NSString stringWithFormat:@"%@ location with %@",
+        share ? @"sharing" : @"unsharing", handle ?: @"<nil>"] tag:@"FMF"];
+    return FMFWatchRequest(share ? @"/share" : @"/unshare", params, NULL);
 }
 
 - (NSDictionary *)batteryStatus {
