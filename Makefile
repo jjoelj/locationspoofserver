@@ -66,7 +66,7 @@ include $(THEOS_MAKE_PATH)/library.mk
 # Tailscale, so the phone can expose itself over Funnel without an SSH-forward
 # relay box. Built from source on demand and dropped into the package; the 58MB
 # of binaries stay out of git. Needs `go` on PATH. See README.
-TAILSCALE_VERSION = v1.102.3
+TAILSCALE_VERSION = v1.102.4
 TS_BIN = layout/usr/local/bin
 # Not /var/run/tailscaled.socket: that one belongs to the Tailscale iOS app.
 TS_SOCK = /var/run/lss-tailscaled.socket
