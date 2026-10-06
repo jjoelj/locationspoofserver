@@ -8,6 +8,16 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
+
+// SSE: external clients get push instead of polling over Tailscale. The stream
+// never triggers a locate; it re-reads fmfwatchd's cache over loopback (cheap)
+// every kStreamInterval and emits only on change, so updates land within 5s of
+// an auto-refresh or someone else's /friends/refresh. ponytail: per-stream poll + blocking worker, capped at
+// kMaxStreams; if many clients ever stream, switch to one shared poller fanning
+// out, or a notify_post from fmfwatchd's StoreLocation to wake the loop.
+static const NSTimeInterval kStreamInterval = 5.0;
+static const int kMaxStreams = 16;
 
 @interface LSSLocalHTTPServer ()
 @property(nonatomic, assign) int listenFD;
@@ -119,6 +129,75 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
     (void)write(fd, body.bytes, body.length);
 }
 
+// Optional numeric query param. Absent -> def; present but unparseable or
+// outside [lo, hi] -> NO, so a typo'd acc= doesn't silently become 0.
+static BOOL OptDouble(NSDictionary *q, NSString *key, double def, double lo, double hi, double *out) {
+    NSString *s = q[key];
+    if (!s) { *out = def; return YES; }
+    NSScanner *sc = [NSScanner scannerWithString:s];
+    double v;
+    if (![sc scanDouble:&v] || !sc.isAtEnd || !isfinite(v) || v < lo || v > hi) return NO;
+    *out = v;
+    return YES;
+}
+
+// Write the whole buffer, retrying short writes. Returns NO on error/timeout,
+// which is how a dead or wedged SSE client gets detected and reaped.
+static BOOL WriteAll(int fd, NSString *s) {
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    const uint8_t *p = d.bytes;
+    size_t left = d.length;
+    while (left) {
+        ssize_t w = write(fd, p, left);
+        if (w <= 0) return NO;
+        p += w;
+        left -= (size_t)w;
+    }
+    return YES;
+}
+
+// Holds the connection open and pushes a `data:` frame whenever the friends
+// snapshot changes, with a heartbeat otherwise. Runs on the per-client worker,
+// so it blocks that worker until the client goes away -- bounded by kMaxStreams.
+- (void)streamFriends:(int)cfd handle:(NSString *)handle token:(NSString *)token {
+    static _Atomic int gStreamCount = 0;
+    if (atomic_fetch_add(&gStreamCount, 1) + 1 > kMaxStreams) {
+        atomic_fetch_sub(&gStreamCount, 1);
+        WriteHTTP(cfd, 503, "Service Unavailable", "too many streams\n");
+        close(cfd);
+        return;
+    }
+
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream; charset=utf-8\r\n"
+        "Cache-Control: no-cache\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    BOOL alive = write(cfd, hdr, strlen(hdr)) > 0;
+
+    NSString *last = nil;
+    // Re-check the token every tick: regenerateToken must cut off streams opened
+    // with the old one, and -stop must end them too.
+    while (alive && self.listenFD >= 0 && TokenOK(token, self.authToken)) {
+        @autoreleasepool {
+            NSString *json = [[LSSDaemonController shared] friendsJSONForHandle:handle];
+            if (![json isEqualToString:last]) {
+                last = json;
+                alive = WriteAll(cfd, [NSString stringWithFormat:@"data: %@\n\n", json]);
+            } else {
+                alive = WriteAll(cfd, @": hb\n\n");  // keepalive + death detection
+            }
+        }
+        if (alive) [NSThread sleepForTimeInterval:kStreamInterval];
+    }
+
+    close(cfd);
+    atomic_fetch_sub(&gStreamCount, 1);
+    [self log:@"stream closed"];
+}
+
 - (void)handleClient:(int)cfd {
     // This socket is reachable from the internet through Funnel. A client that
     // connects and then says nothing would otherwise park a GCD worker forever,
@@ -169,6 +248,19 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
     if ([path isEqualToString:@"/"]) {
         WriteHTTP(cfd, 200, "OK", "ok\n");
         close(cfd);
+        return;
+    }
+
+    if ([path isEqualToString:@"/friends/stream"]) {
+        NSDictionary *q = ParseQuery(query);
+        if (!TokenOK(q[@"token"], self.authToken)) {
+            WriteHTTP(cfd, 403, "Forbidden", "invalid or missing token\n");
+            close(cfd);
+            return;
+        }
+        // streamFriends owns the fd from here: it loops until the client drops
+        // and closes it itself, so no close()/return fallthrough below.
+        [self streamFriends:cfd handle:q[@"handle"] token:q[@"token"]];
         return;
     }
 
@@ -269,9 +361,46 @@ static void WriteJSON(int fd, int status, const char *statusText, NSDictionary *
             return;
         }
 
-        [self log:[NSString stringWithFormat:@"pushing location %.6f, %.6f", dlat, dlon]];
+        // Everything past lat/lon is optional; locationd passes every field
+        // through to clients verbatim (checked with frida in routined). The old
+        // bare lat/lon push reported hacc=0, which no real fix ever has.
+        // Defaults read as a stationary outdoor GPS fix: -1 means "unknown",
+        // same as CoreLocation. ponytail: fixed acc, add jitter if a consumer
+        // ever fingerprints a constant 5m.
+        BOOL hasAlt = q[@"alt"] != nil, hasSpeed = q[@"speed"] != nil, hasCourse = q[@"course"] != nil;
+        double acc, alt, vacc, speed, sacc, course, cacc;
+        if (!OptDouble(q, @"acc", 5.0, 0.001, 100000.0, &acc) ||
+            !OptDouble(q, @"alt", 0.0, -1000.0, 100000.0, &alt) ||
+            !OptDouble(q, @"vacc", 3.0, 0.001, 100000.0, &vacc) ||
+            !OptDouble(q, @"speed", -1.0, 0.0, 1000.0, &speed) ||
+            !OptDouble(q, @"sacc", 0.5, 0.0, 1000.0, &sacc) ||
+            !OptDouble(q, @"course", -1.0, 0.0, 360.0, &course) ||
+            !OptDouble(q, @"cacc", 10.0, 0.0, 180.0, &cacc)) {
+            WriteHTTP(cfd, 400, "Bad Request",
+                "bad optional field. acc>0 (m), alt (m), vacc>0 (m, needs alt), speed>=0 (m/s), sacc, course 0..360, cacc\n");
+            close(cfd);
+            return;
+        }
+        // An accuracy without its value would mark a default (alt 0, speed -1)
+        // as measured, so it only counts alongside the field it qualifies.
+        if (!hasAlt) vacc = -1.0;
+        if (!hasSpeed) sacc = -1.0;
+        if (!hasCourse) cacc = -1.0;
+
+        CLLocation *loc = [[CLLocation alloc]
+            initWithCoordinate:CLLocationCoordinate2DMake(dlat, dlon)
+                      altitude:alt
+            horizontalAccuracy:acc
+              verticalAccuracy:vacc
+                        course:course
+                courseAccuracy:cacc
+                         speed:speed
+                 speedAccuracy:sacc
+                     timestamp:[NSDate date]];
+
+        [self log:[NSString stringWithFormat:@"pushing %@", loc]];
         if (self.locationSink) {
-            self.locationSink(dlat, dlon);
+            self.locationSink(loc);
         }
 
         // Echo what we parsed, not what was sent: no unbounded caller-controlled

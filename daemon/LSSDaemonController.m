@@ -261,16 +261,13 @@ static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
     self.publicServer = [[LSSLocalHTTPServer alloc] init];
     self.publicServer.authToken = self.setEndpointToken;
 
-    self.publicServer.locationSink = ^(double lat, double lon) {
-        CLLocationCoordinate2D c = CLLocationCoordinate2DMake(lat, lon);
-        if (!CLLocationCoordinate2DIsValid(c)) {
-            [[LSSLogger shared] log:[NSString stringWithFormat:@"reject invalid lat/lon %.6f %.6f", lat, lon] tag:@"LOCSIM"];
+    self.publicServer.locationSink = ^(CLLocation *loc) {
+        if (!CLLocationCoordinate2DIsValid(loc.coordinate)) {
+            [[LSSLogger shared] log:[NSString stringWithFormat:@"reject invalid %@", loc] tag:@"LOCSIM"];
             return;
         }
-
-        CLLocation *loc = [[CLLocation alloc] initWithLatitude:c.latitude longitude:c.longitude];
         [[LSSLocSimController shared] pushLocation:loc];
-        [[LSSLogger shared] log:[NSString stringWithFormat:@"applied lat=%.6f lon=%.6f", lat, lon] tag:@"LOCSIM"];
+        [[LSSLogger shared] log:[NSString stringWithFormat:@"applied %@", loc] tag:@"LOCSIM"];
     };
 
     [self.publicServer startOnPort:self.publicPort];

@@ -220,9 +220,10 @@ device; there is no way to set one by hand.
 | Endpoint | Does |
 | --- | --- |
 | `GET /` | Health check. `ok`. The only unauthenticated route |
-| `GET /set?lat=..&lon=..&token=..` | Sets the simulated location |
+| `GET /set?lat=..&lon=..&token=..` | Sets the simulated location. Optional: `acc` (m, default 5), `alt` + `vacc` (m), `speed` + `sacc` (m/s), `course` + `cacc` (deg) |
 | `GET /friends?token=..` | Cached Find My friend locations |
 | `GET /friends/refresh?token=..` | Same, forcing a fresh fetch first |
+| `GET /friends/stream?token=..` | Server-sent events: pushes `/friends` JSON whenever it changes (checked every 5s) |
 | `GET /following?token=..` | Handles that can see *my* location right now |
 | `GET /share?handle=..&token=..` | Start sharing my location with that handle. `&hours=N` to expire it |
 | `GET /unshare?handle=..&token=..` | Stop sharing my location with that handle |
