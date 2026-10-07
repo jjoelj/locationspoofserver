@@ -240,6 +240,19 @@ same as doing it in Find My. Both answer with the follower list as fmfd sees it
 straight afterwards, so `sharing` in the response is the state that actually
 took, not just an acknowledgement that the request was sent.
 
+`/share` strips formatting from phone numbers first (`+1 555-010-0199` becomes
+`+15550100199`): Find My only reaches the other person's devices with the bare
+form, and a formatted share "succeeds" but leaves them seeing "No location
+found". The response's `handle` is the form actually shared, and the one
+`/following` will list. `/unshare` takes the handle exactly as `/following`
+reports it, so shares made formatted by older versions can still be removed.
+
+The daemon remembers the last `/set` location and re-applies it on its own
+whenever locationd restarts, including the restart every install or upgrade
+does. Right after a fresh install, or the first upgrade from 0.4.0 or older,
+there is nothing to re-apply yet: until your client sends one `/set`, the phone
+reports its real location.
+
 The token travels in the query string, so it will appear in the logs of
 anything between you and the phone. Regenerate it from the app if you think it
 has leaked; that invalidates the old one immediately.

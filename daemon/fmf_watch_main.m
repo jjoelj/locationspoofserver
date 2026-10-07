@@ -543,7 +543,19 @@ static NSDictionary *FollowingJSONObject(void) {
 // share=YES sends a "Share My Location" offer (the recipient is notified and
 // can see me from then on); share=NO revokes it. endDate nil shares
 // indefinitely, matching Find My's "Share Indefinitely".
+// "+1 555-010-0199" -> "+15550100199". fmfd only IDS-validates the bare form;
+// a formatted number still gets a 200 from the offer, but no IDS mapping
+// packet goes to the recipient, so their Find My shows "No location found".
+// Emails pass through. Share only: unshare must match the handle exactly as
+// stored, and older shares were stored formatted.
+static NSString *BareHandle(NSString *hid) {
+    if ([hid containsString:@"@"]) return hid;
+    NSCharacterSet *drop = [[NSCharacterSet characterSetWithCharactersInString:@"+0123456789"] invertedSet];
+    return [[hid componentsSeparatedByCharactersInSet:drop] componentsJoinedByString:@""];
+}
+
 static NSDictionary *SetSharing(NSString *hid, BOOL share, NSDate *endDate) {
+    if (share) hid = BareHandle(hid);
     if (!hid.length) return @{@"ok": @NO, @"message": @"missing handle"};
     FMFHandle *h = [gHandleCls handleWithId:hid];
     if (!h) return @{@"ok": @NO, @"message": @"bad handle"};
