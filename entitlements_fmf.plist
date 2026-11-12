@@ -24,5 +24,22 @@
 	     Siri holds this to read them; untested whether it is what we lack. -->
 	<key>com.apple.icloud.searchpartyd.securelocations.access</key>
 	<true/>
+	<!-- The rest copied from Find My.app's own set (iOS 18.6): the secure
+	     locations service itself, plus the keychain groups that likely hold
+	     the keys for decrypting friends' end-to-end encrypted locations.
+	     fmfwatchd was SIGKILLed the instant the first location arrived. -->
+	<key>com.apple.icloud.searchpartyd.securelocations</key>
+	<true/>
+	<key>com.apple.locationd.effective_bundle</key>
+	<true/>
+	<key>com.apple.private.security.storage.FindMy</key>
+	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>com.apple.findmy</string>
+		<string>com.apple.findmy.findmylocated</string>
+		<string>com.apple.findmy.fmfcore.notbackedup</string>
+		<string>com.apple.findmy.fmipcore.notbackedup</string>
+	</array>
 </dict>
 </plist>
