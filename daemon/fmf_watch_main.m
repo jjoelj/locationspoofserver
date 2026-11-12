@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <mach/mach.h>
 
 static const int kWatchPort = 8766;
 static const NSTimeInterval kRefreshDeadline = 40.0;
@@ -160,6 +161,14 @@ static void LogOnce(NSString *key, NSString *line) {
     Log([@"watch FML probe: " stringByAppendingString:line]);
 }
 
+// What jetsam counts against our limit.
+static NSString *Footprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &n) != KERN_SUCCESS) return @"?";
+    return [NSString stringWithFormat:@"%.1fMB", info.phys_footprint / 1048576.0];
+}
+
 static NSString *Shape(id v) {
     if (!v) return @"nil";
     NSUInteger n = [v respondsToSelector:@selector(count)] ? [v count] : 0;
@@ -221,7 +230,7 @@ static void PollFML(NSArray<NSString *> *ids) {
         id h;
         @synchronized (gLock) { h = gHandlesById[hid]; }
         FMLLocation *l = h ? [gFMLSession cachedLocationForHandle:h] : nil;
-        LogOnce([@"cached-class " stringByAppendingString:hid],
+        LogOnce([NSString stringWithFormat:@"cached-class %@ %@", hid, l ? NSStringFromClass([l class]) : @"nil"],
             [NSString stringWithFormat:@"cachedLocationForHandle handle=%@ -> %@", hid, l ? NSStringFromClass([l class]) : @"nil"]);
         if (![l respondsToSelector:@selector(latitude)]) continue;
         LogOnce([@"ts " stringByAppendingString:hid],
@@ -783,7 +792,10 @@ static void StartAutoRefreshTimer(void) {
     // Reload the handle list here too: the FMF delegate callbacks that are
     // supposed to announce a new sharer may never fire, and a silently
     // swallowed selector is indistinguishable from one that does not exist.
-    dispatch_source_set_event_handler(gAutoRefreshSource, ^{ TrimLog(); LoadHandles(); MaybeAutoRefresh(); });
+    dispatch_source_set_event_handler(gAutoRefreshSource, ^{
+        if (gFML) Log([@"watch FML probe: footprint " stringByAppendingString:Footprint()]);
+        TrimLog(); LoadHandles(); MaybeAutoRefresh();
+    });
     dispatch_resume(gAutoRefreshSource);
 }
 
@@ -933,8 +945,8 @@ int main(int argc, char **argv) {
             gFML = YES;
             gHandleCls = objc_getClass("FMLHandle");
             gFMLSession = [fmlCls new];
-            Log([NSString stringWithFormat:@"watch backend: FindMyLocate (iOS %@)",
-                NSProcessInfo.processInfo.operatingSystemVersionString]);
+            Log([NSString stringWithFormat:@"watch backend: FindMyLocate (iOS %@), footprint %@",
+                NSProcessInfo.processInfo.operatingSystemVersionString, Footprint()]);
             for (NSString *sel in @[@"startUpdatingFriendsWithInitialUpdates:completion:",
                     @"getFriendsSharingLocationsWithMeWithCompletion:", @"getFriendsFollowingMyLocationWithCompletion:",
                     @"cachedLocationForHandle:", @"stopSharingLocationWith:isFromGroup:completion:",
@@ -946,7 +958,9 @@ int main(int argc, char **argv) {
             // No-arg blocks: only to learn whether these fire. Their real
             // arguments are undocumented, and fewer declared args is safe on arm64.
             if ([gFMLSession respondsToSelector:@selector(setLocationUpdateCallback:)]) {
-                [gFMLSession setLocationUpdateCallback:^{ LogOnce(@"loc-cb", @"locationUpdateCallback fired"); }];
+                [gFMLSession setLocationUpdateCallback:^{
+                    LogOnce(@"loc-cb", [@"locationUpdateCallback fired, footprint " stringByAppendingString:Footprint()]);
+                }];
             }
             if ([gFMLSession respondsToSelector:@selector(setFriendshipUpdateCallback:)]) {
                 [gFMLSession setFriendshipUpdateCallback:^{

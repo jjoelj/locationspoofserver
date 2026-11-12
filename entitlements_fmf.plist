@@ -20,5 +20,9 @@
 	<true/>
 	<key>com.apple.findmy.findmylocate.settings</key>
 	<true/>
+	<!-- iOS 18 friend locations are end-to-end encrypted via searchpartyd.
+	     Siri holds this to read them; untested whether it is what we lack. -->
+	<key>com.apple.icloud.searchpartyd.securelocations.access</key>
+	<true/>
 </dict>
 </plist>
