@@ -563,8 +563,15 @@ static NSString *FriendsJSON(NSString *handle) {
     // cache is empty, but Messages holds every friend's last fix. Fetch that
     // snapshot (no locate) before the first answer instead of showing everyone
     // unavailable until the next refresh.
+    // At most once every 5 minutes: if the tweak never answers (no loader,
+    // say), streams read this every second and would relaunch Messages each time.
+    static NSTimeInterval lastColdTry;
     BOOL cold;
-    @synchronized (gLock) { cold = gLastIngest == 0; }
+    @synchronized (gLock) {
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        cold = gLastIngest == 0 && now - lastColdTry > 300;
+        if (cold) lastColdTry = now;
+    }
     if (cold) {
         WakeMessages();
         NSDate *end = [NSDate dateWithTimeIntervalSinceNow:6];

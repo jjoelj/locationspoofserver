@@ -10,15 +10,20 @@
 #include <stdio.h>
 #include <stdatomic.h>
 
-// SSE: external clients get push instead of polling over Tailscale. The stream
-// re-reads fmfwatchd's cache over loopback (cheap) every kStreamInterval and
-// emits only on change. With ?refresh=1 it also starts a locate as it opens,
-// so friends arrive one burst at a time as Messages delivers them instead of
-// all at once when /friends/refresh finally returns. ponytail: per-stream poll
-// + blocking worker, capped at kMaxStreams; if many clients ever stream,
-// switch to one shared poller fanning out, or a notify_post from fmfwatchd's
-// /ingest to wake the loop.
+// SSE: external clients get push instead of polling over Tailscale. An open
+// stream is "live": it refreshes as it opens, then every kLiveIntervalOne (its
+// handle) or kLiveIntervalAll (everyone), and re-reads fmfwatchd's cache over loopback
+// every kStreamInterval, emitting on change, so fixes arrive as Messages
+// delivers them. Nothing refreshes once the last stream closes. Concurrent
+// streams' refreshes join each other in fmfwatchd: one locate, not several.
+// ponytail: per-stream poll + blocking worker, capped at kMaxStreams; if many
+// clients ever stream, switch to one shared poller fanning out, or a
+// notify_post from fmfwatchd's /ingest to wake the loop.
 static const NSTimeInterval kStreamInterval = 1.0;
+// Each refresh may wake Messages and wakes the friend's phone for a GPS fix.
+// A fix takes ~6-12s to land, so faster than ~15s just skips ticks.
+static const NSTimeInterval kLiveIntervalOne = 15.0;  // ?handle=: watching one person
+static const NSTimeInterval kLiveIntervalAll = 30.0;  // everyone: 24 locates, batched by fmfd
 static const int kHeartbeatTicks = 15;  // ": hb" at most every 15s
 static const int kMaxStreams = 16;
 
@@ -162,7 +167,7 @@ static BOOL WriteAll(int fd, NSString *s) {
 // Holds the connection open and pushes a `data:` frame whenever the friends
 // snapshot changes, with a heartbeat otherwise. Runs on the per-client worker,
 // so it blocks that worker until the client goes away -- bounded by kMaxStreams.
-- (void)streamFriends:(int)cfd handle:(NSString *)handle token:(NSString *)token refresh:(BOOL)refresh {
+- (void)streamFriends:(int)cfd handle:(NSString *)handle token:(NSString *)token {
     static _Atomic int gStreamCount = 0;
     if (atomic_fetch_add(&gStreamCount, 1) + 1 > kMaxStreams) {
         atomic_fetch_sub(&gStreamCount, 1);
@@ -180,13 +185,10 @@ static BOOL WriteAll(int fd, NSString *s) {
         "\r\n";
     BOOL alive = write(cfd, hdr, strlen(hdr)) > 0;
 
-    if (refresh) {
-        // Fire and forget: the stream itself delivers the results as they land.
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            BOOL started;
-            [[LSSDaemonController shared] refreshFriendsJSONForHandle:handle ifStarted:&started];
-        });
-    }
+    // One refresh in flight per stream: a slow one (a friend whose phone is
+    // off takes the full deadline) makes the next tick skip, not stack up.
+    dispatch_semaphore_t gate = dispatch_semaphore_create(1);
+    NSDate *nextRefresh = [NSDate distantPast];
 
     NSString *last = nil;
     int quiet = 0;
@@ -194,6 +196,19 @@ static BOOL WriteAll(int fd, NSString *s) {
     // with the old one, and -stop must end them too.
     while (alive && self.listenFD >= 0 && TokenOK(token, self.authToken)) {
         @autoreleasepool {
+            // Heartbeats are 15s apart, so notice a client that hung up now,
+            // before starting another refresh that would wake Messages for nobody.
+            char peek;
+            if (recv(cfd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) break;
+            if (nextRefresh.timeIntervalSinceNow <= 0 && dispatch_semaphore_wait(gate, DISPATCH_TIME_NOW) == 0) {
+                nextRefresh = [NSDate dateWithTimeIntervalSinceNow:handle.length ? kLiveIntervalOne : kLiveIntervalAll];
+                // Fire and forget: the loop below delivers the results as they land.
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    BOOL started;
+                    [[LSSDaemonController shared] refreshFriendsJSONForHandle:handle ifStarted:&started];
+                    dispatch_semaphore_signal(gate);
+                });
+            }
             NSString *json = [[LSSDaemonController shared] friendsJSONForHandle:handle];
             if (![json isEqualToString:last]) {
                 last = json;
@@ -273,7 +288,7 @@ static BOOL WriteAll(int fd, NSString *s) {
         }
         // streamFriends owns the fd from here: it loops until the client drops
         // and closes it itself, so no close()/return fallthrough below.
-        [self streamFriends:cfd handle:q[@"handle"] token:q[@"token"] refresh:[q[@"refresh"] isEqualToString:@"1"]];
+        [self streamFriends:cfd handle:q[@"handle"] token:q[@"token"]];
         return;
     }
 
