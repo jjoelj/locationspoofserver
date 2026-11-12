@@ -456,7 +456,20 @@ static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
 }
 
 - (NSDictionary *)logs {
-    return @{@"ok": @YES, @"logs": [[LSSLogger shared] snapshot] ?: @""};
+    // fmfwatchd is a separate process; its last lines go to the app's Find My
+    // pane, so problems are visible without SSH. Last 8KB only: polled often.
+    NSString *fmf = @"";
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:@"/var/log/fmfwatchd.log"];
+    if (fh) {
+        unsigned long long size = [fh seekToEndOfFile];
+        [fh seekToFileOffset:size > 8192 ? size - 8192 : 0];
+        NSString *tail = [[NSString alloc] initWithData:[fh readDataToEndOfFile] encoding:NSUTF8StringEncoding];
+        [fh closeFile];
+        NSArray *lines = [tail componentsSeparatedByString:@"\n"];
+        if (size > 8192 && lines.count > 1) lines = [lines subarrayWithRange:NSMakeRange(1, lines.count - 1)]; // partial first line
+        fmf = [lines componentsJoinedByString:@"\n"] ?: @"";
+    }
+    return @{@"ok": @YES, @"logs": [[LSSLogger shared] snapshot] ?: @"", @"fmfLogs": fmf};
 }
 
 @end

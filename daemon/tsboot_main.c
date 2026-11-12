@@ -12,12 +12,24 @@
 
 #include <spawn.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
 
+// tailscaled shares our stderr (/var/log/tailscaled.log), which launchd only
+// ever appends to; empty it past 1MB. lseek covers a non-O_APPEND open.
+static void trim_log(void) {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) == 0 && st.st_size > (1 << 20)) {
+        ftruncate(STDERR_FILENO, 0);
+        lseek(STDERR_FILENO, 0, SEEK_SET);
+    }
+}
+
 int main(void) {
+    trim_log();
     char *argv[] = {
         THEOS_PACKAGE_INSTALL_PREFIX "/usr/local/bin/tailscaled",
         "--tun=userspace-networking",
@@ -35,8 +47,16 @@ int main(void) {
     fprintf(stderr, "tsboot: tailscaled started as pid %d\n", pid);
     fflush(stderr);
 
+    // Poll instead of blocking so the log can be trimmed meanwhile; 5s is the
+    // most a dead tailscaled waits before KeepAlive restarts it.
     int status;
-    if (waitpid(pid, &status, 0) < 0) return 1;
+    for (int i = 1;; i++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (r < 0) return 1;
+        if (i % 12 == 0) trim_log();
+        sleep(5);
+    }
 
     if (WIFSIGNALED(status)) {
         fprintf(stderr, "tsboot: tailscaled killed by signal %d\n", WTERMSIG(status));

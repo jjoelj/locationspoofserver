@@ -13,5 +13,12 @@
 	     connects and lists handles but never pushes fixes. -->
 	<key>com.apple.icloud.findmydeviced.access</key>
 	<true/>
+	<!-- iOS 17+: friends moved to findmylocated. Messages holds these. -->
+	<key>com.apple.findmy.findmylocate.friendshipservice</key>
+	<true/>
+	<key>com.apple.findmy.findmylocate.locationservice</key>
+	<true/>
+	<key>com.apple.findmy.findmylocate.settings</key>
+	<true/>
 </dict>
 </plist>

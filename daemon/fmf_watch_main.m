@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const int kWatchPort = 8766;
 static const NSTimeInterval kRefreshDeadline = 40.0;
@@ -51,6 +52,48 @@ static const NSTimeInterval kShareDeadline = 20.0;
 - (void)sendFriendshipOfferToHandle:(id)h groupId:(id)g callerId:(id)c endDate:(NSDate *)e completion:(id)completion;
 - (void)stopSharingMyLocationWithHandle:(id)h groupId:(id)g callerId:(id)c completion:(id)completion;
 @end
+
+// iOS 17+ moved friends to FindMyLocate (findmylocated); FMFSession still
+// loads there but lists nobody. Same split BlueBubbles makes for macOS 14+.
+@interface FMLHandle : NSObject
++ (instancetype)handleWithIdentifier:(NSString *)i;
+- (NSString *)identifier;
+@end
+
+@interface FMLLocation : NSObject
+- (double)latitude;
+- (double)longitude;
+- (double)horizontalAccuracy;
+- (double)timestamp;
+@end
+
+@interface FindMyLocateSession : NSObject
+- (void)startUpdatingFriendsWithInitialUpdates:(BOOL)initial completion:(id)c;
+- (void)getFriendsSharingLocationsWithMeWithCompletion:(void (^)(id friends))c;
+- (void)getFriendsFollowingMyLocationWithCompletion:(void (^)(id friends))c;
+- (FMLLocation *)cachedLocationForHandle:(id)h;
+- (void)startRefreshingLocationForHandles:(id)handles priority:(long long)p isFromGroup:(BOOL)g
+                           reverseGeocode:(BOOL)geo completion:(id)c;
+- (void)stopSharingLocationWith:(id)h isFromGroup:(BOOL)g completion:(id)c;
+- (void)setLocationUpdateCallback:(id)c;
+- (void)setFriendshipUpdateCallback:(id)c;
+@end
+
+// An FMLLocation in FMFLocation's shape, so everything downstream of gLatest
+// stays backend-agnostic.
+@interface LSSFix : NSObject
+@property(nonatomic) CLLocationCoordinate2D coordinate;
+@property(nonatomic, strong) NSDate *timestamp;
+@property(nonatomic) BOOL isValid;
+@property(nonatomic) double horizontalAccuracy;
+@property(nonatomic, copy) NSString *shortAddress;
+@property(nonatomic, copy) NSString *longAddress;
+@end
+@implementation LSSFix
+@end
+
+static BOOL gFML;
+static FindMyLocateSession *gFMLSession;
 
 static NSMutableDictionary<NSString *, FMFLocation *> *gLatest;
 static NSMutableDictionary<NSString *, FMFHandle *> *gHandlesById;
@@ -96,6 +139,35 @@ static void Log(NSString *line) {
     fprintf(stderr, "%s\n", line.UTF8String);
 }
 
+// launchd appends our stderr to /var/log/fmfwatchd.log forever; empty it
+// past 1MB. lseek too, in case launchd did not open it O_APPEND.
+static void TrimLog(void) {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) == 0 && st.st_size > (1 << 20)) {
+        ftruncate(STDERR_FILENO, 0);
+        lseek(STDERR_FILENO, 0, SEEK_SET);
+    }
+}
+
+// For FindMyLocate unknowns: each answer is logged once, not per poll.
+static void LogOnce(NSString *key, NSString *line) {
+    static NSMutableSet *seen;
+    @synchronized (NSNull.null) {
+        if (!seen) seen = [NSMutableSet set];
+        if ([seen containsObject:key]) return;
+        [seen addObject:key];
+    }
+    Log([@"watch FML probe: " stringByAppendingString:line]);
+}
+
+static NSString *Shape(id v) {
+    if (!v) return @"nil";
+    NSUInteger n = [v respondsToSelector:@selector(count)] ? [v count] : 0;
+    id first = [v respondsToSelector:@selector(anyObject)] ? [v anyObject]
+             : [v respondsToSelector:@selector(firstObject)] ? [v firstObject] : nil;
+    return [NSString stringWithFormat:@"%@ count=%lu first=%@", [v class], (unsigned long)n, first ? NSStringFromClass([first class]) : @"-"];
+}
+
 static BOOL IsRecentRefreshLocation(FMFLocation *loc) {
     return gRefreshStart > 0 &&
         loc.timestamp.timeIntervalSince1970 >= gRefreshStart - gRefreshCacheWindow;
@@ -117,10 +189,8 @@ static BOOL CanBeLocated(NSString *hid) {
     return gEverLocated.count == 0 || [gEverLocated containsObject:hid];
 }
 
-static void StoreLocation(FMFLocation *loc) {
-    if (![loc isKindOfClass:objc_getClass("FMFLocation")]) return;
-    NSString *hid = [loc.handle respondsToSelector:@selector(identifier)] ? [loc.handle identifier] : nil;
-    if (!hid.length) return;
+static void StoreFix(NSString *hid, FMFLocation *loc) {
+    if (!hid.length || !loc) return;
     @synchronized (gLock) {
         FMFLocation *prev = gLatest[hid];
         if (!prev || loc.timestamp.timeIntervalSince1970 >= prev.timestamp.timeIntervalSince1970) {
@@ -128,6 +198,55 @@ static void StoreLocation(FMFLocation *loc) {
         }
         if (IsKnownLocation(loc)) [gEverLocated addObject:hid];
     }
+}
+
+static void StoreLocation(FMFLocation *loc) {
+    if (![loc isKindOfClass:objc_getClass("FMFLocation")]) return;
+    StoreFix([loc.handle respondsToSelector:@selector(identifier)] ? [loc.handle identifier] : nil, loc);
+}
+
+// FMLLocation.timestamp is an undeclared unit; magnitude decides (from
+// BlueBubbles): ms since 1970, seconds since 2001, or seconds since 1970.
+static NSDate *FMLDate(double raw) {
+    if (raw <= 0) return nil;
+    if (raw > 1e11) return [NSDate dateWithTimeIntervalSince1970:raw / 1000];
+    if (raw < 1e9) return [NSDate dateWithTimeIntervalSinceReferenceDate:raw];
+    return [NSDate dateWithTimeIntervalSince1970:raw];
+}
+
+// ponytail: polls the session's local cache instead of typing
+// locationUpdateCallback, whose block signature is undocumented.
+static void PollFML(NSArray<NSString *> *ids) {
+    for (NSString *hid in ids) {
+        id h;
+        @synchronized (gLock) { h = gHandlesById[hid]; }
+        FMLLocation *l = h ? [gFMLSession cachedLocationForHandle:h] : nil;
+        LogOnce([@"cached-class " stringByAppendingString:hid],
+            [NSString stringWithFormat:@"cachedLocationForHandle handle=%@ -> %@", hid, l ? NSStringFromClass([l class]) : @"nil"]);
+        if (![l respondsToSelector:@selector(latitude)]) continue;
+        LogOnce([@"ts " stringByAppendingString:hid],
+            [NSString stringWithFormat:@"timestamp handle=%@ raw=%.3f read-as=%@ hasCoords=%d",
+                hid, l.timestamp, FMLDate(l.timestamp), l.latitude != 0 || l.longitude != 0]);
+        LSSFix *f = [LSSFix new];
+        f.coordinate = CLLocationCoordinate2DMake(l.latitude, l.longitude);
+        f.timestamp = FMLDate(l.timestamp);
+        f.horizontalAccuracy = l.horizontalAccuracy;
+        f.isValid = f.timestamp != nil;
+        StoreFix(hid, (FMFLocation *)f);
+    }
+}
+
+// FMLFriend -> FMLHandle, keyed by identifier.
+static NSDictionary<NSString *, id> *FMLHandlesById(id friends) {
+    id v = [friends respondsToSelector:@selector(allObjects)] ? [friends allObjects] : friends;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    if (![v respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return out;
+    for (id f in v) {
+        id h = [f respondsToSelector:@selector(handle)] ? [f handle] : nil;
+        NSString *hid = [h respondsToSelector:@selector(identifier)] ? [h identifier] : nil;
+        if (hid.length) out[hid] = h;
+    }
+    return out;
 }
 
 static void StoreLocations(id locations) {
@@ -173,33 +292,25 @@ static void InstallFMFSessionLocationHook(Class sessionClass) {
     method_setImplementation(m, replacement);
 }
 
-static void LoadHandles(void) {
-    [gSession getHandlesSharingLocationsWithMeWithGroupId:nil completion:^(NSArray *ids) {
-        NSArray *idArray = [ids respondsToSelector:@selector(allObjects)] ? [(id)ids allObjects] : ids;
-        NSMutableArray *handles = [NSMutableArray array];
-        NSMutableSet<NSString *> *loadedIds = [NSMutableSet set];
-        NSMutableDictionary<NSString *, FMFHandle *> *loadedById = [NSMutableDictionary dictionary];
-        for (id x in idArray) {
-            NSString *identifier = [x isKindOfClass:NSString.class] ? x : [x description];
-            if (!identifier.length) continue;
-            FMFHandle *h = [gHandleCls handleWithId:identifier];
-            if (!h) continue;
-            [handles addObject:h];
-            [loadedIds addObject:identifier];
-            loadedById[identifier] = h;
-        }
+static void ApplyHandles(NSDictionary<NSString *, id> *loadedById) {
+        NSArray *handles = loadedById.allValues;
+        NSMutableSet<NSString *> *loadedIds = [NSMutableSet setWithArray:loadedById.allKeys];
         // Swap in whole, not clear-then-fill: this now runs on a timer, and the
         // old in-place rebuild left a window where /friends read an empty set.
         BOOL discovered;
         @synchronized (gLock) {
             discovered = gHandlesLoaded && ![loadedIds isSubsetOfSet:gKnownIds];
             gKnownIds = loadedIds;
-            gHandlesById = loadedById;
+            gHandlesById = [loadedById mutableCopy];
             gHandlesLoaded = YES;
         }
-        [gSession setHandles:[NSSet setWithArray:handles]];
-        for (FMFHandle *h in handles) {
-            [gSession locationForHandle:h completion:^(FMFLocation *loc) { StoreLocation(loc); }];
+        if (gFML) {
+            PollFML(loadedById.allKeys);
+        } else {
+            [gSession setHandles:[NSSet setWithArray:handles]];
+            for (FMFHandle *h in handles) {
+                [gSession locationForHandle:h completion:^(FMFLocation *loc) { StoreLocation(loc); }];
+            }
         }
         Log([NSString stringWithFormat:@"watch handles loaded: %lu", (unsigned long)handles.count]);
         // A brand-new sharer is not in gEverLocated, so MaybeAutoRefresh will
@@ -212,6 +323,26 @@ static void LoadHandles(void) {
                 Refresh(nil, nil, 1);
             });
         }
+}
+
+static void LoadHandles(void) {
+    if (gFML) {
+        [gFMLSession getFriendsSharingLocationsWithMeWithCompletion:^(id friends) {
+            LogOnce(@"sharing-shape", [@"getFriendsSharingLocationsWithMe -> " stringByAppendingString:Shape(friends)]);
+            ApplyHandles(FMLHandlesById(friends));
+        }];
+        return;
+    }
+    [gSession getHandlesSharingLocationsWithMeWithGroupId:nil completion:^(NSArray *ids) {
+        NSArray *idArray = [ids respondsToSelector:@selector(allObjects)] ? [(id)ids allObjects] : ids;
+        NSMutableDictionary<NSString *, FMFHandle *> *loadedById = [NSMutableDictionary dictionary];
+        for (id x in idArray) {
+            NSString *identifier = [x isKindOfClass:NSString.class] ? x : [x description];
+            if (!identifier.length) continue;
+            FMFHandle *h = [gHandleCls handleWithId:identifier];
+            if (h) loadedById[identifier] = h;
+        }
+        ApplyHandles(loadedById);
     }];
 }
 
@@ -274,6 +405,18 @@ static NSArray<FMFHandle *> *HandlesForIds(NSArray<NSString *> *ids) {
 
 static void RequestRefresh(NSString *handle, NSArray<FMFHandle *> *handles, NSString *callerId, long long priority) {
     id completion = ^{};
+
+    if (gFML) {
+        // 1000 is BlueBubbles' working value; FML priorities are not FMF's.
+        Log([NSString stringWithFormat:@"watch FML startRefreshing count=%lu", (unsigned long)handles.count]);
+        NSTimeInterval t0 = [NSDate date].timeIntervalSince1970;
+        [gFMLSession startRefreshingLocationForHandles:handles priority:1000 isFromGroup:NO
+                                        reverseGeocode:NO completion:^{
+            Log([NSString stringWithFormat:@"watch FML probe: startRefreshing completion after %.1fs",
+                [NSDate date].timeIntervalSince1970 - t0]);
+        }];
+        return;
+    }
 
     if (handle.length && handles.count == 1 &&
         [gSession respondsToSelector:@selector(refreshLocationForHandle:callerId:priority:completion:)]) {
@@ -358,6 +501,7 @@ static NSDictionary *Refresh(NSString *handle, NSString *callerId, long long pri
                     return @{@"ok": @NO, @"message": @"friends refresh superseded", @"handle": handle ?: @""};
                 }
             }
+            if (gFML) PollFML(ids);
             if (CoverageComplete()) break;
         }
 
@@ -484,6 +628,7 @@ static NSDictionary *FriendRow(NSString *hid, FMFLocation *loc, NSDictionary *ge
 }
 
 static NSString *FriendsJSON(NSString *handle) {
+    if (gFML) PollFML(AllIdsSnapshot());
     NSMutableArray *friends = [NSMutableArray array];
     BOOL loaded;
     NSArray *ids;
@@ -526,10 +671,18 @@ static NSArray<NSString *> *StringIds(id ids) {
 static NSArray<NSString *> *FollowingMyLocation(void) {
     __block NSArray<NSString *> *out = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [gSession getHandlesFollowingMyLocationWithGroupId:nil completion:^(NSArray *ids) {
-        out = StringIds(ids);
-        dispatch_semaphore_signal(sem);
-    }];
+    if (gFML) {
+        [gFMLSession getFriendsFollowingMyLocationWithCompletion:^(id friends) {
+            LogOnce(@"following-shape", [@"getFriendsFollowingMyLocation -> " stringByAppendingString:Shape(friends)]);
+            out = [FMLHandlesById(friends).allKeys sortedArrayUsingSelector:@selector(compare:)];
+            dispatch_semaphore_signal(sem);
+        }];
+    } else {
+        [gSession getHandlesFollowingMyLocationWithGroupId:nil completion:^(NSArray *ids) {
+            out = StringIds(ids);
+            dispatch_semaphore_signal(sem);
+        }];
+    }
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kShareDeadline * NSEC_PER_SEC)));
     return out;
 }
@@ -557,7 +710,10 @@ static NSString *BareHandle(NSString *hid) {
 static NSDictionary *SetSharing(NSString *hid, BOOL share, NSDate *endDate) {
     if (share) hid = BareHandle(hid);
     if (!hid.length) return @{@"ok": @NO, @"message": @"missing handle"};
-    FMFHandle *h = [gHandleCls handleWithId:hid];
+    // ponytail: FML's offer takes an undocumented `expiration` long long; a
+    // wrong guess shares for the wrong duration. Unsupported until verified.
+    if (gFML && share) return @{@"ok": @NO, @"message": @"sharing not supported on iOS 17+ yet"};
+    FMFHandle *h = gFML ? [gHandleCls handleWithIdentifier:hid] : [gHandleCls handleWithId:hid];
     if (!h) return @{@"ok": @NO, @"message": @"bad handle"};
 
     Log([NSString stringWithFormat:@"watch %@ handle=%@ until=%@",
@@ -565,7 +721,13 @@ static NSDictionary *SetSharing(NSString *hid, BOOL share, NSDate *endDate) {
 
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     id done = ^{ dispatch_semaphore_signal(sem); };
-    if (share) {
+    if (gFML) {
+        Log([NSString stringWithFormat:@"watch FML probe: stopSharingLocationWith handle class=%@", [h class]]);
+        [gFMLSession stopSharingLocationWith:h isFromGroup:NO completion:^{
+            Log(@"watch FML probe: stopSharingLocationWith completion fired");
+            dispatch_semaphore_signal(sem);
+        }];
+    } else if (share) {
         [gSession sendFriendshipOfferToHandle:h groupId:nil callerId:nil endDate:endDate completion:done];
     } else {
         [gSession stopSharingMyLocationWithHandle:h groupId:nil callerId:nil completion:done];
@@ -621,7 +783,7 @@ static void StartAutoRefreshTimer(void) {
     // Reload the handle list here too: the FMF delegate callbacks that are
     // supposed to announce a new sharer may never fire, and a silently
     // swallowed selector is indistinguishable from one that does not exist.
-    dispatch_source_set_event_handler(gAutoRefreshSource, ^{ LoadHandles(); MaybeAutoRefresh(); });
+    dispatch_source_set_event_handler(gAutoRefreshSource, ^{ TrimLog(); LoadHandles(); MaybeAutoRefresh(); });
     dispatch_resume(gAutoRefreshSource);
 }
 
@@ -750,6 +912,7 @@ static void StartHTTPServer(void) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        TrimLog();
         gLatest = [NSMutableDictionary dictionary];
         gGeocode = [NSMutableDictionary dictionary];
         gGeocoding = [NSMutableSet set];
@@ -760,6 +923,47 @@ int main(int argc, char **argv) {
         gRefreshLogged = [NSMutableSet set];
         gLock = [NSObject new];
         gRefreshCacheWindow = kBulkRefreshCacheWindow;
+
+        Class fmlCls = Nil;
+        if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 17 &&
+            dlopen("/System/Library/PrivateFrameworks/FindMyLocateObjCWrapper.framework/FindMyLocateObjCWrapper", RTLD_NOW)) {
+            fmlCls = objc_getClass("FindMyLocateSession");
+        }
+        if (fmlCls) {
+            gFML = YES;
+            gHandleCls = objc_getClass("FMLHandle");
+            gFMLSession = [fmlCls new];
+            Log([NSString stringWithFormat:@"watch backend: FindMyLocate (iOS %@)",
+                NSProcessInfo.processInfo.operatingSystemVersionString]);
+            for (NSString *sel in @[@"startUpdatingFriendsWithInitialUpdates:completion:",
+                    @"getFriendsSharingLocationsWithMeWithCompletion:", @"getFriendsFollowingMyLocationWithCompletion:",
+                    @"cachedLocationForHandle:", @"stopSharingLocationWith:isFromGroup:completion:",
+                    @"startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:",
+                    @"setLocationUpdateCallback:", @"setFriendshipUpdateCallback:"]) {
+                if (![gFMLSession respondsToSelector:NSSelectorFromString(sel)]) Log([@"watch FML probe: MISSING " stringByAppendingString:sel]);
+            }
+            if (![gHandleCls respondsToSelector:@selector(handleWithIdentifier:)]) Log(@"watch FML probe: MISSING +[FMLHandle handleWithIdentifier:]");
+            // No-arg blocks: only to learn whether these fire. Their real
+            // arguments are undocumented, and fewer declared args is safe on arm64.
+            if ([gFMLSession respondsToSelector:@selector(setLocationUpdateCallback:)]) {
+                [gFMLSession setLocationUpdateCallback:^{ LogOnce(@"loc-cb", @"locationUpdateCallback fired"); }];
+            }
+            if ([gFMLSession respondsToSelector:@selector(setFriendshipUpdateCallback:)]) {
+                [gFMLSession setFriendshipUpdateCallback:^{
+                    LogOnce(@"friend-cb", @"friendshipUpdateCallback fired");
+                    ScheduleLoadHandles(@"FML friendshipUpdateCallback");
+                }];
+            }
+            [gFMLSession startUpdatingFriendsWithInitialUpdates:YES completion:^{
+                Log(@"watch FML probe: startUpdatingFriends completion fired");
+                ScheduleLoadHandles(@"FML startUpdatingFriends");
+            }];
+            LoadHandles();
+            StartHTTPServer();
+            StartAutoRefreshTimer();
+            [[NSRunLoop currentRunLoop] run];
+            return 0;
+        }
 
         if (!dlopen("/System/Library/PrivateFrameworks/FMFCore.framework/FMFCore", RTLD_NOW)) {
             Log(@"FMFCore unavailable");

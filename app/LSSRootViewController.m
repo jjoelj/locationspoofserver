@@ -41,6 +41,9 @@ static UIImage *QRImage(NSString *string) {
 @property(nonatomic, strong) LSSDaemonClient *daemon;
 
 @property(nonatomic, strong) UITextView *serverLogView;
+@property(nonatomic, strong) UITextView *fmfLogView;
+@property(nonatomic, strong) UILabel *fmfLogCaption;
+@property(nonatomic, copy) NSString *fmfLogRaw;
 @property(nonatomic, strong) UITextView *logView;
 
 @property(nonatomic, strong) UILabel *tokenCaption;
@@ -424,6 +427,14 @@ static UIImage *QRImage(NSString *string) {
     self.serverLogView.layer.borderWidth = 1.0;
     self.serverLogView.layer.borderColor = [UIColor systemGray4Color].CGColor;
 
+    self.fmfLogCaption = [self makeCaption:@"FIND MY LOG"];
+    self.fmfLogView = [[UITextView alloc] init];
+    self.fmfLogView.editable = NO;
+    self.fmfLogView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    self.fmfLogView.layer.cornerRadius = 12;
+    self.fmfLogView.layer.borderWidth = 1.0;
+    self.fmfLogView.layer.borderColor = [UIColor systemGray4Color].CGColor;
+
     self.logCaption = [self makeCaption:@"APP LOG"];
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
@@ -441,6 +452,7 @@ static UIImage *QRImage(NSString *string) {
         self.serverActions,
         self.statusCaption, self.statusRow,
         self.serverLogCaption, self.serverLogView,
+        self.fmfLogCaption, self.fmfLogView,
         self.logCaption, self.logView,
     ]];
     column.axis = UILayoutConstraintAxisVertical;
@@ -452,6 +464,7 @@ static UIImage *QRImage(NSString *string) {
     [column setCustomSpacing:18 afterView:self.serverActions];
     [column setCustomSpacing:18 afterView:self.statusRow];
     [column setCustomSpacing:14 afterView:self.serverLogView];
+    [column setCustomSpacing:14 afterView:self.fmfLogView];
 
     [self.view addSubview:column];
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -462,6 +475,7 @@ static UIImage *QRImage(NSString *string) {
         [column.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12],
 
         [self.serverLogView.heightAnchor constraintEqualToAnchor:self.logView.heightAnchor],
+        [self.fmfLogView.heightAnchor constraintEqualToAnchor:self.logView.heightAnchor],
         [self.serverLogView.heightAnchor constraintGreaterThanOrEqualToConstant:100],
     ]];
 }
@@ -486,11 +500,12 @@ static UIImage *QRImage(NSString *string) {
     [view scrollRangeToVisible:NSMakeRange(view.text.length - 1, 1)];
 }
 
-// Both panes, re-rendered from what we last had. Called when a Show/Hide
+// All panes, re-rendered from what we last had. Called when a Show/Hide
 // toggle flips, so the masking changes the moment the label does.
 - (void)refreshLogViews {
     [self setLogText:[[LSSLogger shared] snapshot] inView:self.logView];
     [self setLogText:self.serverLogRaw inView:self.serverLogView];
+    [self setLogText:self.fmfLogRaw inView:self.fmfLogView];
 }
 
 - (void)log:(NSString *)line {
@@ -518,11 +533,12 @@ static UIImage *QRImage(NSString *string) {
 
 - (void)startLogPolling {
     __weak typeof(self) weakSelf = self;
-    [self.daemon getLogs:^(BOOL ok, NSString *logs) {
+    [self.daemon getLogs:^(BOOL ok, NSString *logs, NSString *fmfLogs) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!ok) return;
             weakSelf.serverLogRaw = logs;
-            [weakSelf setLogText:logs inView:weakSelf.serverLogView];
+            weakSelf.fmfLogRaw = fmfLogs;
+            [weakSelf refreshLogViews];
             [weakSelf log:@"log polling started"];
         });
     }];
@@ -534,11 +550,14 @@ static UIImage *QRImage(NSString *string) {
         // Daemon may start after us; the URL also shows up late, once a login lands.
         if (weakSelf.token.length == 0 || weakSelf.publicURL.length == 0) [weakSelf fetchToken];
         if (++tick % 4 == 0) [weakSelf refreshStatus];         // liveness moves slower than logs
-        [weakSelf.daemon getLogs:^(BOOL ok, NSString *logs) {
+        [weakSelf.daemon getLogs:^(BOOL ok, NSString *logs, NSString *fmfLogs) {
             if (!ok || !logs) return;
             dispatch_async(dispatch_get_main_queue(), ^{
                 weakSelf.serverLogRaw = logs;
+                weakSelf.fmfLogRaw = fmfLogs;
                 [weakSelf setLogText:logs inView:weakSelf.serverLogView];
+                if (![weakSelf.fmfLogView.text isEqualToString:[weakSelf censor:fmfLogs]])
+                    [weakSelf setLogText:fmfLogs inView:weakSelf.fmfLogView];
             });
         }];
     }];

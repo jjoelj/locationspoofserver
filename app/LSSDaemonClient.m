@@ -31,9 +31,9 @@
     }] resume];
 }
 
-- (void)getLogs:(void (^)(BOOL ok, NSString *logs))completion {
+- (void)getLogs:(void (^)(BOOL ok, NSString *logs, NSString *fmfLogs))completion {
     [self request:@"/logs" method:@"GET" json:nil completion:^(BOOL ok, NSDictionary *resp) {
-        completion(ok, resp[@"logs"] ?: @"");
+        completion(ok, resp[@"logs"] ?: @"", resp[@"fmfLogs"] ?: @"");
     }];
 }
 

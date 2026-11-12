@@ -4,7 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface LSSDaemonClient : NSObject
 
-- (void)getLogs:(void (^)(BOOL ok, NSString *logs))completion;
+- (void)getLogs:(void (^)(BOOL ok, NSString *logs, NSString *fmfLogs))completion;
 /// Daemon name -> @(BOOL) running. Empty when the control server is unreachable.
 - (void)getStatus:(void (^)(BOOL ok, NSDictionary *daemons))completion;
 /// `url` is the public Funnel URL, or empty when the node isn't reachable yet.
