@@ -73,6 +73,7 @@ static const NSTimeInterval kShareDeadline = 20.0;
 - (void)getFriendsSharingLocationsWithMeWithCompletion:(void (^)(id friends))c;
 - (void)getFriendsFollowingMyLocationWithCompletion:(void (^)(id friends))c;
 - (FMLLocation *)cachedLocationForHandle:(id)h;
+- (FMLLocation *)cachedLocationForHandle:(id)h includeAddress:(BOOL)a;
 - (void)startRefreshingLocationForHandles:(id)handles priority:(long long)p isFromGroup:(BOOL)g
                            reverseGeocode:(BOOL)geo completion:(id)c;
 - (void)stopSharingLocationWith:(id)h isFromGroup:(BOOL)g completion:(id)c;
@@ -225,11 +226,13 @@ static NSDate *FMLDate(double raw) {
 
 // ponytail: polls the session's local cache instead of typing
 // locationUpdateCallback, whose block signature is undocumented.
+// includeAddress:YES is the exact read BlueBubbles' helper uses; the plain
+// cachedLocationForHandle: returned nil for every handle on iOS 18.
 static void PollFML(NSArray<NSString *> *ids) {
     for (NSString *hid in ids) {
         id h;
         @synchronized (gLock) { h = gHandlesById[hid]; }
-        FMLLocation *l = h ? [gFMLSession cachedLocationForHandle:h] : nil;
+        FMLLocation *l = h ? [gFMLSession cachedLocationForHandle:h includeAddress:YES] : nil;
         LogOnce([NSString stringWithFormat:@"cached-class %@ %@", hid, l ? NSStringFromClass([l class]) : @"nil"],
             [NSString stringWithFormat:@"cachedLocationForHandle handle=%@ -> %@", hid, l ? NSStringFromClass([l class]) : @"nil"]);
         if (![l respondsToSelector:@selector(latitude)]) continue;
@@ -955,13 +958,10 @@ int main(int argc, char **argv) {
                 if (![gFMLSession respondsToSelector:NSSelectorFromString(sel)]) Log([@"watch FML probe: MISSING " stringByAppendingString:sel]);
             }
             if (![gHandleCls respondsToSelector:@selector(handleWithIdentifier:)]) Log(@"watch FML probe: MISSING +[FMLHandle handleWithIdentifier:]");
-            // No-arg blocks: only to learn whether these fire. Their real
-            // arguments are undocumented, and fewer declared args is safe on arm64.
-            if ([gFMLSession respondsToSelector:@selector(setLocationUpdateCallback:)]) {
-                [gFMLSession setLocationUpdateCallback:^{
-                    LogOnce(@"loc-cb", [@"locationUpdateCallback fired, footprint " stringByAppendingString:Footprint()]);
-                }];
-            }
+            // Deliberately NOT registering setLocationUpdateCallback: asking for
+            // pushed (decrypted) locations is what fires right before the
+            // silent SIGKILL. If dropping it keeps fmfwatchd alive, the push
+            // path is the killer; we then read fixes from the polled cache.
             if ([gFMLSession respondsToSelector:@selector(setFriendshipUpdateCallback:)]) {
                 [gFMLSession setFriendshipUpdateCallback:^{
                     LogOnce(@"friend-cb", @"friendshipUpdateCallback fired");
