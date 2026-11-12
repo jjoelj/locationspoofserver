@@ -24,16 +24,12 @@
 	     Siri holds this to read them; untested whether it is what we lack. -->
 	<key>com.apple.icloud.searchpartyd.securelocations.access</key>
 	<true/>
-	<!-- The rest copied from Find My.app's own set (iOS 18.6): the secure
-	     locations service itself, plus the keychain groups that likely hold
-	     the keys for decrypting friends' end-to-end encrypted locations.
-	     fmfwatchd was SIGKILLed the instant the first location arrived. -->
-	<key>com.apple.icloud.searchpartyd.securelocations</key>
-	<true/>
-	<key>com.apple.locationd.effective_bundle</key>
-	<true/>
-	<key>com.apple.private.security.storage.FindMy</key>
-	<true/>
+	<!-- Keychain groups that likely hold the keys for decrypting friends'
+	     end-to-end encrypted locations. The bare securelocations,
+	     locationd.effective_bundle and private.security.storage.FindMy that
+	     0.7.2 also added are dropped here: one of those three AMFI-killed
+	     fmfwatchd at launch on iOS 18. Keychain groups don't cause a launch
+	     kill (a disallowed group just fails the query), so they stay. -->
 	<key>keychain-access-groups</key>
 	<array>
 		<string>com.apple.findmy</string>
