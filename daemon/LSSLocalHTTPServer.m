@@ -11,12 +11,15 @@
 #include <stdatomic.h>
 
 // SSE: external clients get push instead of polling over Tailscale. The stream
-// never triggers a locate; it re-reads fmfwatchd's cache over loopback (cheap)
-// every kStreamInterval and emits only on change, so updates land within 5s of
-// an auto-refresh or someone else's /friends/refresh. ponytail: per-stream poll + blocking worker, capped at
-// kMaxStreams; if many clients ever stream, switch to one shared poller fanning
-// out, or a notify_post from fmfwatchd's StoreLocation to wake the loop.
-static const NSTimeInterval kStreamInterval = 5.0;
+// re-reads fmfwatchd's cache over loopback (cheap) every kStreamInterval and
+// emits only on change. With ?refresh=1 it also starts a locate as it opens,
+// so friends arrive one burst at a time as Messages delivers them instead of
+// all at once when /friends/refresh finally returns. ponytail: per-stream poll
+// + blocking worker, capped at kMaxStreams; if many clients ever stream,
+// switch to one shared poller fanning out, or a notify_post from fmfwatchd's
+// /ingest to wake the loop.
+static const NSTimeInterval kStreamInterval = 1.0;
+static const int kHeartbeatTicks = 15;  // ": hb" at most every 15s
 static const int kMaxStreams = 16;
 
 @interface LSSLocalHTTPServer ()
@@ -159,7 +162,7 @@ static BOOL WriteAll(int fd, NSString *s) {
 // Holds the connection open and pushes a `data:` frame whenever the friends
 // snapshot changes, with a heartbeat otherwise. Runs on the per-client worker,
 // so it blocks that worker until the client goes away -- bounded by kMaxStreams.
-- (void)streamFriends:(int)cfd handle:(NSString *)handle token:(NSString *)token {
+- (void)streamFriends:(int)cfd handle:(NSString *)handle token:(NSString *)token refresh:(BOOL)refresh {
     static _Atomic int gStreamCount = 0;
     if (atomic_fetch_add(&gStreamCount, 1) + 1 > kMaxStreams) {
         atomic_fetch_sub(&gStreamCount, 1);
@@ -177,7 +180,16 @@ static BOOL WriteAll(int fd, NSString *s) {
         "\r\n";
     BOOL alive = write(cfd, hdr, strlen(hdr)) > 0;
 
+    if (refresh) {
+        // Fire and forget: the stream itself delivers the results as they land.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            BOOL started;
+            [[LSSDaemonController shared] refreshFriendsJSONForHandle:handle ifStarted:&started];
+        });
+    }
+
     NSString *last = nil;
+    int quiet = 0;
     // Re-check the token every tick: regenerateToken must cut off streams opened
     // with the old one, and -stop must end them too.
     while (alive && self.listenFD >= 0 && TokenOK(token, self.authToken)) {
@@ -186,7 +198,8 @@ static BOOL WriteAll(int fd, NSString *s) {
             if (![json isEqualToString:last]) {
                 last = json;
                 alive = WriteAll(cfd, [NSString stringWithFormat:@"data: %@\n\n", json]);
-            } else {
+                quiet = 0;
+            } else if (++quiet % kHeartbeatTicks == 0) {
                 alive = WriteAll(cfd, @": hb\n\n");  // keepalive + death detection
             }
         }
@@ -260,7 +273,7 @@ static BOOL WriteAll(int fd, NSString *s) {
         }
         // streamFriends owns the fd from here: it loops until the client drops
         // and closes it itself, so no close()/return fallthrough below.
-        [self streamFriends:cfd handle:q[@"handle"] token:q[@"token"]];
+        [self streamFriends:cfd handle:q[@"handle"] token:q[@"token"] refresh:[q[@"refresh"] isEqualToString:@"1"]];
         return;
     }
 

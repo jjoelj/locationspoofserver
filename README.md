@@ -248,8 +248,8 @@ device; there is no way to set one by hand.
 | `GET /` | Health check. `ok`. The only unauthenticated route |
 | `GET /set?lat=..&lon=..&token=..` | Sets the simulated location. Optional: `acc` (m, default 5), `alt` + `vacc` (m), `speed` + `sacc` (m/s), `course` + `cacc` (deg) |
 | `GET /friends?token=..` | Cached Find My friend locations |
-| `GET /friends/refresh?token=..` | Same, forcing a fresh fetch first |
-| `GET /friends/stream?token=..` | Server-sent events: pushes `/friends` JSON whenever it changes (checked every 5s) |
+| `GET /friends/refresh?token=..` | Same, after a fresh locate: waits until every friend has a new fix (up to ~40s, +3s if Messages has to be woken), then answers. Concurrent calls each get an answer; a call that overlaps one already running joins it. `&handle=` refreshes one friend |
+| `GET /friends/stream?token=..` | Server-sent events: pushes `/friends` JSON whenever it changes (checked every second). Add `&refresh=1` to start a locate as it opens and get friends as they're found; `&handle=` limits it to one friend |
 | `GET /following?token=..` | Handles that can see *my* location right now |
 | `GET /share?handle=..&token=..` | Start sharing my location with that handle. `&hours=N` to expire it |
 | `GET /unshare?handle=..&token=..` | Stop sharing my location with that handle |

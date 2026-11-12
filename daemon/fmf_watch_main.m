@@ -23,11 +23,10 @@ static const NSTimeInterval kRefreshDeadline = 40.0;
 static const NSTimeInterval kSingleRefreshCacheWindow = 30.0;
 static const NSTimeInterval kBulkRefreshCacheWindow = 60.0;
 static const NSTimeInterval kRunLoopStep = 0.2;
-// FMF drops coordinates off cached fixes as they age; auto-refresh when a
-// /friends read sees anything older than this (or with no fix at all).
-static const NSTimeInterval kAutoRefreshAge = 10 * 60;
-static const NSTimeInterval kAutoRefreshMinInterval = 5 * 60;
-static const NSTimeInterval kAutoRefreshTick = 5 * 60;
+// Housekeeping only: trim the log, reload the friends list. The server never
+// starts a locate on its own: each one wakes Messages, so clients ask for
+// fresh data (/refresh, or a stream with refresh=1) when they want it.
+static const NSTimeInterval kMaintenanceTick = 5 * 60;
 static const NSTimeInterval kShareDeadline = 20.0;
 
 @interface FMFLocation : NSObject
@@ -99,18 +98,12 @@ static NSMutableSet<NSString *> *gKnownIds;
 // with me but is offline right now" from "never shares with me at all" --
 // FMF lists both, and only the former is worth waiting on or refreshing for.
 static NSMutableSet<NSString *> *gEverLocated;
-static NSMutableSet<NSString *> *gRefreshExpected;
-static NSMutableSet<NSString *> *gRefreshLogged;
+// Locates being waited on right now, by key: a handle, or "*" for everyone.
+static NSMutableSet<NSString *> *gInFlight;
 static NSObject *gLock;
 static FMFSession *gSession;
 static Class gHandleCls;
 static BOOL gHandlesLoaded;
-static BOOL gRefreshInProgress;
-static NSUInteger gRefreshGeneration;
-static NSString *gRefreshKey;
-static NSTimeInterval gRefreshStart;
-static NSTimeInterval gLastAutoRefresh;
-static NSTimeInterval gRefreshCacheWindow;
 // Consecutive bulk refreshes that came back with nothing at all. An FMFSession
 // held open for days rots: fmfd still accepts locate requests and still answers
 // cached reads, but stops actually locating, so fixes only land while the Find
@@ -124,7 +117,7 @@ static const NSUInteger kDeadRefreshStreakLimit = 3;
 
 static NSTimeInterval gLastIngest;
 static dispatch_source_t gHTTPSource;
-static dispatch_source_t gAutoRefreshSource;
+static dispatch_source_t gMaintenanceSource;
 static BOOL gHandleReloadScheduled;
 static int gListenFD = -1;
 
@@ -144,11 +137,6 @@ static void TrimLog(void) {
         ftruncate(STDERR_FILENO, 0);
         lseek(STDERR_FILENO, 0, SEEK_SET);
     }
-}
-
-static BOOL IsRecentRefreshLocation(FMFLocation *loc) {
-    return gRefreshStart > 0 &&
-        loc.timestamp.timeIntervalSince1970 >= gRefreshStart - gRefreshCacheWindow;
 }
 
 static BOOL IsKnownLocation(FMFLocation *loc) {
@@ -233,8 +221,15 @@ static pid_t MessagesPid(void) {
 // gives the tweak a ~27s background task to catch the refresh. Resuming it in
 // place is not possible: RunningBoard only lets SpringBoard assert on apps.
 // ponytail: closing a suspended Messages costs the user a cold start next time.
+// One at a time: concurrent refreshes would otherwise both see silence and the
+// second would close the Messages the first just relaunched.
 static void WakeMessages(void) {
+    static NSObject *wakeLock;
+    static dispatch_once_t lockOnce;
+    dispatch_once(&lockOnce, ^{ wakeLock = [NSObject new]; });
+    @synchronized (wakeLock) {
     NSTimeInterval t0 = [NSDate date].timeIntervalSince1970;
+    @synchronized (gLock) { if (t0 - gLastIngest < 2) return; }  // it just answered someone
     notify_post("io.github.jjoelj.lss.fmf-ping");
     if (TweakAnsweredSince(t0, 1.5)) return;
 
@@ -253,6 +248,7 @@ static void WakeMessages(void) {
     BOOL up = r == 0 && TweakAnsweredSince(t0, 10);
     Log([NSString stringWithFormat:@"watch Messages %@, relaunched in background (%d), tweak %@",
         pid > 0 ? @"was suspended" : @"was not running", r, up ? @"answered" : @"did not answer"]);
+    }
 }
 
 // FMLFriend -> FMLHandle, keyed by identifier.
@@ -288,25 +284,13 @@ static void ApplyHandles(NSDictionary<NSString *, id> *loadedById) {
         NSMutableSet<NSString *> *loadedIds = [NSMutableSet setWithArray:loadedById.allKeys];
         // Swap in whole, not clear-then-fill: this now runs on a timer, and the
         // old in-place rebuild left a window where /friends read an empty set.
-        BOOL discovered;
         @synchronized (gLock) {
-            discovered = gHandlesLoaded && ![loadedIds isSubsetOfSet:gKnownIds];
             gKnownIds = loadedIds;
             gHandlesById = [loadedById mutableCopy];
             gHandlesLoaded = YES;
         }
         if (!gFML) [gSession setHandles:[NSSet setWithArray:handles]];
         Log([NSString stringWithFormat:@"watch handles loaded: %lu", (unsigned long)handles.count]);
-        // A brand-new sharer is not in gEverLocated, so MaybeAutoRefresh will
-        // never consider them stale and they would sit at valid:false until an
-        // unrelated friend went stale. One bulk locate bootstraps them; if it
-        // yields nothing they are correctly treated as one-way from then on.
-        if (discovered) {
-            Log(@"watch new handle appeared, locating");
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                Refresh(nil, nil, 1);
-            });
-        }
 }
 
 static void LoadHandles(void) {
@@ -343,30 +327,19 @@ static void ScheduleLoadHandles(NSString *reason) {
     });
 }
 
-static BOOL CoverageComplete(void) {
-    @synchronized (gLock) {
-        if (gRefreshExpected.count == 0) return YES;
-        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        BOOL complete = YES;
-        for (NSString *hid in gRefreshExpected) {
-            FMFLocation *loc = gLatest[hid];
-            if (!loc || !IsRecentRefreshLocation(loc)) {
-                complete = NO;
-                continue;
-            }
-            if (![gRefreshLogged containsObject:hid]) {
-                [gRefreshLogged addObject:hid];
-                Log([NSString stringWithFormat:@"watch refresh fresh handle=%@ elapsed=%.1fs age=%.1fs timestamp=%lld",
-                    hid, now - gRefreshStart, now - loc.timestamp.timeIntervalSince1970,
-                    (long long)loc.timestamp.timeIntervalSince1970]);
-            }
-        }
-        return complete;
+// Logs each expected friend once as its fix lands. Caller must hold gLock.
+static NSUInteger CountFresh(NSSet<NSString *> *expected, NSTimeInterval since, NSTimeInterval start,
+                             NSMutableSet<NSString *> *logged) {
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    for (NSString *hid in expected) {
+        FMFLocation *loc = gLatest[hid];
+        if (!loc || loc.timestamp.timeIntervalSince1970 < since || [logged containsObject:hid]) continue;
+        [logged addObject:hid];
+        Log([NSString stringWithFormat:@"watch refresh fresh handle=%@ elapsed=%.1fs age=%.1fs timestamp=%lld",
+            hid, now - start, now - loc.timestamp.timeIntervalSince1970,
+            (long long)loc.timestamp.timeIntervalSince1970]);
     }
-}
-
-static NSString *RefreshKey(NSString *handle) {
-    return handle.length ? handle : @"*";
+    return logged.count;
 }
 
 static NSArray<NSString *> *AllIdsSnapshot(void) {
@@ -431,107 +404,81 @@ static void RequestRefresh(NSString *handle, NSArray<FMFHandle *> *handles, NSSt
     [gSession forceRefresh];
 }
 
+// Every request gets an answer: it waits (up to kRefreshDeadline) for its own
+// friends' fixes and returns. A request whose locate is already in flight, or
+// covered by an in-flight refresh of everyone, joins it instead of asking
+// Apple again; nothing is cancelled or turned away.
 static NSDictionary *Refresh(NSString *handle, NSString *callerId, long long priority) {
-    NSString *key = RefreshKey(handle);
-    NSUInteger generation;
-    @synchronized (gLock) {
-        if (gRefreshInProgress && [gRefreshKey isEqualToString:key]) {
-            return @{@"ok": @NO, @"message": @"friends refresh already in progress", @"handle": handle ?: @""};
-        }
-        // A different handle supersedes the old wait. FMF does not expose a
-        // cancel primitive here; advancing the generation lets the old request
-        // stop waiting and lets this one own the current forceRefresh cycle.
-        gRefreshGeneration++;
-        generation = gRefreshGeneration;
-        gRefreshInProgress = YES;
-        gRefreshKey = [key copy];
+    NSString *key = handle.length ? handle : @"*";
+    NSArray<NSString *> *ids = handle.length ? @[handle] : AllIdsSnapshot();
+    NSArray<FMFHandle *> *handles = HandlesForIds(ids);
+    if (ids.count == 0 || handles.count == 0) {
+        return @{@"ok": @NO, @"message": handle.length ? @"friend handle not found" : @"no friend handles loaded"};
     }
 
-    @try {
-        NSArray<NSString *> *ids = handle.length ? @[handle] : AllIdsSnapshot();
-        NSArray<FMFHandle *> *handles = HandlesForIds(ids);
-        if (ids.count == 0 || handles.count == 0) {
-            return @{@"ok": @NO, @"message": handle.length ? @"friend handle not found" : @"no friend handles loaded"};
-        }
-
-        WakeMessages();
-
-        @synchronized (gLock) {
-            NSMutableSet *expected = [NSMutableSet setWithArray:ids];
-            if (!handle.length) {
-                for (NSString *hid in ids) {
-                    // Only drop handles that have *never* located. Dropping on
-                    // "no valid fix right now" made a stale set collapse to
-                    // empty, so coverage completed instantly and every refresh
-                    // reported success without waiting for anything.
-                    if (!CanBeLocated(hid)) {
-                        [expected removeObject:hid];
-                        Log([NSString stringWithFormat:@"watch refresh skipping never-located handle=%@", hid]);
-                    }
-                }
+    BOOL join;
+    NSMutableSet<NSString *> *expected = [NSMutableSet setWithArray:ids];
+    @synchronized (gLock) {
+        join = [gInFlight containsObject:key] || [gInFlight containsObject:@"*"];
+        if (!join) [gInFlight addObject:key];
+        if (!handle.length) {
+            for (NSString *hid in ids) {
+                // Only drop handles that have *never* located. Dropping on
+                // "no valid fix right now" made a stale set collapse to
+                // empty, so coverage completed instantly and every refresh
+                // reported success without waiting for anything.
+                if (!CanBeLocated(hid)) [expected removeObject:hid];
             }
-            gRefreshExpected = expected;
-            [gRefreshLogged removeAllObjects];
-            gRefreshCacheWindow = handle.length ? kSingleRefreshCacheWindow : kBulkRefreshCacheWindow;
-            gRefreshStart = [NSDate date].timeIntervalSince1970;
+        }
+    }
+    NSTimeInterval start = [NSDate date].timeIntervalSince1970;
+    NSTimeInterval since = start - (handle.length ? kSingleRefreshCacheWindow : kBulkRefreshCacheWindow);
+
+    @try {
+        if (join) {
+            Log([NSString stringWithFormat:@"watch refresh key=%@ joining a locate already in flight", key]);
+        } else {
+            WakeMessages();
+            RequestRefresh(handle, handles, callerId, priority);
         }
 
-        RequestRefresh(handle, handles, callerId, priority);
-
+        NSMutableSet<NSString *> *logged = [NSMutableSet set];
+        NSUInteger freshCount = 0;
         NSDate *end = [NSDate dateWithTimeIntervalSinceNow:kRefreshDeadline];
         while ([end timeIntervalSinceNow] > 0) {
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:kRunLoopStep]];
-            @synchronized (gLock) {
-                if (generation != gRefreshGeneration) {
-                    return @{@"ok": @NO, @"message": @"friends refresh superseded", @"handle": handle ?: @""};
-                }
-            }
-            if (CoverageComplete()) break;
+            @synchronized (gLock) { freshCount = CountFresh(expected, since, start, logged); }
+            if (freshCount >= expected.count) break;
         }
 
-        // A refresh that produced nothing used to be indistinguishable from a
-        // good one: this returned ok:YES either way, so fmfd silently ignoring
-        // our locate requests looked like success while /friends served fixes
-        // that only ever arrived when the Find My app was opened. Say so.
-        NSUInteger expectedCount, freshCount, streak = 0;
-        BOOL healthSignal;
-        @synchronized (gLock) {
-            expectedCount = gRefreshExpected.count;
-            freshCount = gRefreshLogged.count;
-            // Only a bulk refresh is a usable health signal -- a single-handle
-            // miss just means that one friend's device is off or offline.
-            healthSignal = (!handle.length && expectedCount >= 2);
-            if (healthSignal) {
+        if (expected.count > 0) {
+            Log([NSString stringWithFormat:@"watch refresh coverage %lu/%lu key=%@%@",
+                (unsigned long)freshCount, (unsigned long)expected.count, key, join ? @" (joined)" : @""]);
+        }
+        // A bulk locate we sent that produced nothing is the health signal;
+        // a single-handle miss just means that one friend's device is off.
+        if (!join && !handle.length && expected.count >= 2) {
+            NSUInteger streak;
+            @synchronized (gLock) {
                 gDeadRefreshStreak = (freshCount == 0) ? gDeadRefreshStreak + 1 : 0;
                 streak = gDeadRefreshStreak;
             }
-        }
-        if (expectedCount > 0) {
-            Log([NSString stringWithFormat:@"watch refresh coverage %lu/%lu key=%@",
-                (unsigned long)freshCount, (unsigned long)expectedCount, key]);
-        }
-        if (healthSignal && freshCount == 0) {
-            Log([NSString stringWithFormat:
-                @"watch refresh produced no fixes (streak %lu/%lu): fmfd accepted the locate but delivered nothing",
-                (unsigned long)streak, (unsigned long)kDeadRefreshStreakLimit]);
-            if (streak >= kDeadRefreshStreakLimit) {
-                Log(@"watch FMFSession looks dead, exiting so launchd respawns with a fresh one");
-                exit(0);
+            if (freshCount == 0) {
+                Log([NSString stringWithFormat:
+                    @"watch refresh produced no fixes (streak %lu/%lu): the locate was accepted but nothing arrived",
+                    (unsigned long)streak, (unsigned long)kDeadRefreshStreakLimit]);
+                if (streak >= kDeadRefreshStreakLimit) {
+                    Log(@"watch session looks dead, exiting so launchd respawns with a fresh one");
+                    exit(0);
+                }
             }
         }
-
-        // Still ok:YES even with no fixes -- callers want the cached rows, and
-        // the log above is what distinguishes the two cases.
+        // ok:YES even with no fixes -- callers want the cached rows, and the
+        // log above is what distinguishes the two cases.
         return @{@"ok": @YES};
     } @finally {
-        @synchronized (gLock) {
-            if (generation == gRefreshGeneration) {
-                [gRefreshExpected removeAllObjects];
-                [gRefreshLogged removeAllObjects];
-                gRefreshStart = 0;
-                gRefreshInProgress = NO;
-                gRefreshKey = nil;
-            }
+        if (!join) {
+            @synchronized (gLock) { [gInFlight removeObject:key]; }
         }
     }
 }
@@ -612,6 +559,20 @@ static NSDictionary *FriendRow(NSString *hid, FMFLocation *loc, NSDictionary *ge
 }
 
 static NSString *FriendsJSON(NSString *handle) {
+    // Nothing from Messages since we started (install, reboot, respawn): the
+    // cache is empty, but Messages holds every friend's last fix. Fetch that
+    // snapshot (no locate) before the first answer instead of showing everyone
+    // unavailable until the next refresh.
+    BOOL cold;
+    @synchronized (gLock) { cold = gLastIngest == 0; }
+    if (cold) {
+        WakeMessages();
+        NSDate *end = [NSDate dateWithTimeIntervalSinceNow:6];
+        while ([end timeIntervalSinceNow] > 0) {
+            @synchronized (gLock) { if (gLatest.count) break; }
+            usleep(200 * 1000);
+        }
+    }
     NSMutableArray *friends = [NSMutableArray array];
     BOOL loaded;
     NSArray *ids;
@@ -719,50 +680,17 @@ static NSDictionary *SetSharing(NSString *hid, BOOL share, NSDate *endDate) {
     return @{@"ok": @YES, @"handle": hid, @"sharing": @(sharing), @"following": following ?: @[]};
 }
 
-// Kicks off a background bulk refresh (non-blocking) if any known friend's
-// fix is missing or older than kAutoRefreshAge, rate-limited so reads don't
-// pile refreshes on top of each other.
-static void MaybeAutoRefresh(void) {
-    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    @synchronized (gLock) {
-        if (!gHandlesLoaded || gKnownIds.count == 0) return;
-        if (gRefreshInProgress) return;
-        if (now - gLastAutoRefresh < kAutoRefreshMinInterval) return;
-        BOOL stale = NO;
-        for (NSString *hid in gKnownIds) {
-            // A one-way friend can never satisfy this check, so counting them
-            // pinned `stale` to YES forever and put us in a permanent bulk
-            // locate every kAutoRefreshMinInterval, around the clock.
-            if (!CanBeLocated(hid)) continue;
-            FMFLocation *loc = gLatest[hid];
-            if (!IsKnownLocation(loc) ||
-                now - loc.timestamp.timeIntervalSince1970 > kAutoRefreshAge) {
-                stale = YES;
-                break;
-            }
-        }
-        if (!stale) return;
-        gLastAutoRefresh = now;
-    }
-    Log(@"watch auto-refresh: locations stale");
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        Refresh(nil, nil, 1);
-    });
-}
-
-// Keeps fixes warm on its own so opening the app shows fresh locations
-// without a blocking refresh. MaybeAutoRefresh no-ops when nothing is stale.
-static void StartAutoRefreshTimer(void) {
-    gAutoRefreshSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+static void StartMaintenanceTimer(void) {
+    gMaintenanceSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-    dispatch_source_set_timer(gAutoRefreshSource,
+    dispatch_source_set_timer(gMaintenanceSource,
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
-        (uint64_t)(kAutoRefreshTick * NSEC_PER_SEC), (uint64_t)(30 * NSEC_PER_SEC));
-    // Reload the handle list here too: the FMF delegate callbacks that are
+        (uint64_t)(kMaintenanceTick * NSEC_PER_SEC), (uint64_t)(30 * NSEC_PER_SEC));
+    // Reload the handle list here too: the delegate callbacks that are
     // supposed to announce a new sharer may never fire, and a silently
     // swallowed selector is indistinguishable from one that does not exist.
-    dispatch_source_set_event_handler(gAutoRefreshSource, ^{ TrimLog(); LoadHandles(); MaybeAutoRefresh(); });
-    dispatch_resume(gAutoRefreshSource);
+    dispatch_source_set_event_handler(gMaintenanceSource, ^{ TrimLog(); LoadHandles(); });
+    dispatch_resume(gMaintenanceSource);
 }
 
 static NSString *URLDecode(NSString *s) {
@@ -861,8 +789,7 @@ static void HandleClient(int cfd) {
         } else {
             NSData *data = [NSJSONSerialization dataWithJSONObject:refresh options:0 error:nil];
             NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"{\"ok\":false}";
-            BOOL conflict = [refresh[@"message"] isEqualToString:@"friends refresh already in progress"];
-            WriteHTTP(cfd, conflict ? 409 : 200, body);
+            WriteHTTP(cfd, 200, body);
         }
     } else if ([path isEqualToString:@"/following"] ||
                [path isEqualToString:@"/share"] ||
@@ -928,10 +855,8 @@ int main(int argc, char **argv) {
         gHandlesById = [NSMutableDictionary dictionary];
         gKnownIds = [NSMutableSet set];
         gEverLocated = [NSMutableSet set];
-        gRefreshExpected = [NSMutableSet set];
-        gRefreshLogged = [NSMutableSet set];
+        gInFlight = [NSMutableSet set];
         gLock = [NSObject new];
-        gRefreshCacheWindow = kBulkRefreshCacheWindow;
 
         Class fmlCls = Nil;
         if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 17 &&
@@ -955,7 +880,7 @@ int main(int argc, char **argv) {
             }];
             LoadHandles();
             StartHTTPServer();
-            StartAutoRefreshTimer();
+            StartMaintenanceTimer();
             [[NSRunLoop currentRunLoop] run];
             return 0;
         }
@@ -973,7 +898,7 @@ int main(int argc, char **argv) {
         [gSession reloadDataIfNotLoaded];
         LoadHandles();
         StartHTTPServer();
-        StartAutoRefreshTimer();
+        StartMaintenanceTimer();
 
         [[NSRunLoop currentRunLoop] run];
     }
