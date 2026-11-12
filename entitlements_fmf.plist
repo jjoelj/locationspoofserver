@@ -13,29 +13,17 @@
 	     connects and lists handles but never pushes fixes. -->
 	<key>com.apple.icloud.findmydeviced.access</key>
 	<true/>
-	<!-- iOS 17+: friends moved to findmylocated. Messages holds these. -->
+	<!-- iOS 17+: friends moved to findmylocated. Messages holds these. Used to
+	     list friends and trigger locates; never to receive locations. -->
 	<key>com.apple.findmy.findmylocate.friendshipservice</key>
 	<true/>
 	<key>com.apple.findmy.findmylocate.locationservice</key>
 	<true/>
 	<key>com.apple.findmy.findmylocate.settings</key>
 	<true/>
-	<!-- iOS 18 friend locations are end-to-end encrypted via searchpartyd.
-	     Siri holds this to read them; untested whether it is what we lack. -->
-	<key>com.apple.icloud.searchpartyd.securelocations.access</key>
+	<!-- Wakes Messages (where the LSSFindMy tweak reads locations) before a
+	     refresh: SBSLaunchApplicationWithIdentifier(..., suspended). -->
+	<key>com.apple.springboard.launchapplications</key>
 	<true/>
-	<!-- Keychain groups that likely hold the keys for decrypting friends'
-	     end-to-end encrypted locations. The bare securelocations,
-	     locationd.effective_bundle and private.security.storage.FindMy that
-	     0.7.2 also added are dropped here: one of those three AMFI-killed
-	     fmfwatchd at launch on iOS 18. Keychain groups don't cause a launch
-	     kill (a disallowed group just fails the query), so they stay. -->
-	<key>keychain-access-groups</key>
-	<array>
-		<string>com.apple.findmy</string>
-		<string>com.apple.findmy.findmylocated</string>
-		<string>com.apple.findmy.fmfcore.notbackedup</string>
-		<string>com.apple.findmy.fmipcore.notbackedup</string>
-	</array>
 </dict>
 </plist>

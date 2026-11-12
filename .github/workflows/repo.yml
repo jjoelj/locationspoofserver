@@ -31,7 +31,9 @@ env:
   THEOS: ${{ github.workspace }}/theos
   SDK: iPhoneOS16.5.sdk
   SDKS_RELEASE: master-146e41f              # github.com/theos/sdks/releases
-  TOOLCHAIN_RELEASE: test-210562a           # github.com/L1ghtmann/llvm-project/releases
+  # LLVM 19 (v19.0.0-L2): emits the new arm64e ABI the Messages tweak needs.
+  # Needs glibc >= 2.38, which ubuntu-24.04 has.
+  TOOLCHAIN_RELEASE: main-update_3-eabca92  # github.com/L1ghtmann/llvm-project/releases
 
 jobs:
   build:
@@ -70,10 +72,11 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
-          # clang/ld that run on Linux and emit Mach-O for arm64.
+          # The Makefile's SDKBINPATH points here, next to Theos's default slot.
+          mkdir -p "$THEOS/toolchain/iphone-llvm19" "$THEOS/sdks"
+          # clang/ld that run on Linux and emit Mach-O for arm64 and arm64e.
           curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/$TOOLCHAIN_RELEASE/iOSToolchain-x86_64.tar.xz" \
-            | tar -xJf - -C "$THEOS/toolchain"
+            | tar -xJf - -C "$THEOS/toolchain/iphone-llvm19"
           # TARGET in the Makefile picks the newest SDK present, so keeping
           # exactly one here is what makes the build deterministic.
           curl -fsSL "https://github.com/theos/sdks/releases/download/$SDKS_RELEASE/$SDK.tar.xz" \

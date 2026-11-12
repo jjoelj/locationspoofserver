@@ -15,8 +15,11 @@ The API below is plain HTTP, though, so anything that can make a request works.
 
 - A jailbroken iPhone. Developed against iOS 14.3 on a Taurine/libhooker
   device; the Tailscale workarounds below are specific to that vintage. A
-  rootless (`iphoneos-arm64`, e.g. Dopamine/palera1n) package is also built but
-  untested on device so far.
+  rootless (`iphoneos-arm64`, e.g. Dopamine/palera1n) package is also built;
+  spoofing works there, Find My friends on iOS 17+ is still being verified.
+- A tweak loader (libhooker, ElleKit or Substrate). Find My friend locations
+  are read inside Messages (see below), so the package depends on one and your
+  package manager installs it if missing.
 - Root SSH to the phone, with key auth set up, if you build from source or want
   the optional SSH-over-tailnet setup — `ssh root@<phone>` with no password.
 - A [Tailscale](https://tailscale.com) account. Free tier is plenty; this is
@@ -25,7 +28,10 @@ The API below is plain HTTP, though, so anything that can make a request works.
   on-device, but nothing outside the phone can reach it.
 - A package manager on the phone (Sileo, Zebra, Cydia — whatever your
   jailbreak shipped). Building from source instead additionally needs
-  [theos](https://theos.dev) with an iOS SDK and Go 1.24+, as described below.
+  [theos](https://theos.dev) with an iOS SDK, the LLVM 19 toolchain from
+  [L1ghtmann/llvm-project](https://github.com/L1ghtmann/llvm-project/releases)
+  (`v19.0.0-L2`) in `$THEOS/toolchain/iphone-llvm19`, and Go 1.24+, as
+  described below.
 
 ## What gets installed
 
@@ -33,12 +39,27 @@ The API below is plain HTTP, though, so anything that can make a request works.
 | --- | --- |
 | `/Applications/LocationSpoofServer.app` | UI: token and public URL as text or QR, Tailscale login, server restart |
 | `/usr/libexec/locationspoofd` | The server. Public API on `:8080`, control API on `127.0.0.1:31666` |
-| `/usr/libexec/fmfwatchd` | Find My friends watcher, kept separate for entitlement reasons |
+| `/usr/libexec/fmfwatchd` | Find My friends watcher: lists friends and triggers locates, serves the results |
+| `/Library/MobileSubstrate/DynamicLibraries/LSSFindMy.dylib` | Tweak in Messages that reads friends' locations and hands them to `fmfwatchd` |
 | `/usr/libexec/tsboot` | Starts tailscaled; launchd cannot spawn it directly (see below) |
 | `/usr/local/bin/tailscaled`, `/usr/local/bin/tailscale` | Tailscale, userspace mode, socket at `/var/run/lss-tailscaled.socket` |
 | `/usr/lib/securityshim.dylib` | Backfills one Security API that iOS 14 lacks (see below) |
 
 On a rootless jailbreak every path above except `/var/...` sits under `/var/jb`.
+
+### Why friend locations come through Messages
+
+On iOS 17+ friends' locations are end-to-end encrypted, and iOS kills a
+standalone daemon the moment one is delivered to it. Messages is allowed to
+decrypt them, and its Find My client returns the same friends list as the Find
+My app, no chats needed. So `fmfwatchd` triggers the locate, and the
+`LSSFindMy` tweak inside Messages receives the result and posts it to
+`fmfwatchd` over localhost. The same path is used on every iOS version.
+
+iOS suspends Messages in the background, so before a refresh `fmfwatchd` pings
+the tweak; if Messages doesn't answer it is closed and relaunched in the
+background (screen locked is fine), which gives the tweak about 30 seconds to
+catch the results. A Messages you are using always answers and is never closed.
 
 Talking to our tailscaled from a shell needs the socket flag, since the default
 path belongs to the Tailscale iOS app if you have it installed:

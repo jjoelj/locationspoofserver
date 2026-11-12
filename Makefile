@@ -1,4 +1,8 @@
-ARCHS = arm64
+ARCHS = arm64 arm64e
+# LLVM 19 (L1ghtmann v19.0.0-L2): the LSSFindMy tweak loads into Messages, an
+# arm64e process, and iOS 14+ only loads new-ABI arm64e. Theos's default
+# clang 13 emits the old ABI.
+SDKBINPATH = $(THEOS)/toolchain/iphone-llvm19/linux/iphone/bin
 
 TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = LocationSpoofServer
@@ -64,6 +68,15 @@ securityshim_CFLAGS = -fobjc-arc
 securityshim_LDFLAGS = -Wl,-reexport_framework,Security
 
 include $(THEOS_MAKE_PATH)/library.mk
+
+# Reads friends' locations through Messages' own Find My client and hands them
+# to fmfwatchd. See tweak/LSSFindMy.m for why it lives in Messages.
+TWEAK_NAME = LSSFindMy
+LSSFindMy_FILES = tweak/LSSFindMy.m
+LSSFindMy_CFLAGS = -fobjc-arc
+LSSFindMy_FRAMEWORKS = Foundation CoreLocation UIKit
+
+include $(THEOS_MAKE_PATH)/tweak.mk
 
 # Tailscale, so the phone can expose itself over Funnel without an SSH-forward
 # relay box. Built from source on demand and dropped into the package; the 58MB
