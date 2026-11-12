@@ -88,7 +88,7 @@ jobs:
 
       - uses: actions/cache@v6
         with:
-          path: layout/usr/local/bin
+          path: .tailscale
           key: tailscale-${{ steps.ts.outputs.version }}-${{ hashFiles('tools/ios_platform.py') }}
 
       # control is the one place the version lives; a tag only says "ship it",
@@ -118,7 +118,11 @@ jobs:
       # module cache: built in parallel, two of them race on the same .pcm and
       # the build dies with "signature mismatch" perhaps one run in two.
       - name: Build package
-        run: make package FINALPACKAGE=1 THEOS_USE_PARALLEL_BUILDING=0 PACKAGE_VERSION=${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          for scheme in "" rootless; do
+            make package FINALPACKAGE=1 THEOS_USE_PARALLEL_BUILDING=0 PACKAGE_VERSION=${{ steps.ver.outputs.version }} THEOS_PACKAGE_SCHEME=$scheme
+          done
 
       # An APT repo is just the .deb, a Packages index describing it, and a
       # Release naming the source.
@@ -141,7 +145,7 @@ jobs:
           Suite: stable
           Version: 1.0
           Codename: ios
-          Architectures: iphoneos-arm
+          Architectures: iphoneos-arm iphoneos-arm64
           Components: main
           Description: Tweaks and tools by jjoelj
           Date: $(date -uR)

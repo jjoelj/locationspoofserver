@@ -16,7 +16,7 @@ and no load command needs resizing.
 
 Run before codesigning; ldid's signature covers these bytes.
 """
-import struct, sys
+import os, struct, sys
 
 PLATFORM_IOS, MIN_IOS = 2, 14 << 16  # matches TARGET's 14.0 floor in the Makefile
 LC_BUILD_VERSION = 0x32
@@ -27,7 +27,7 @@ MACOS_FRAMEWORK_INFIX = "/Versions/A/"
 # our shim, which defines it and re-exports the real framework. Harmless on
 # iOS 15+: the shim's implementation is equivalent to Apple's.
 SECURITY_PATH = "/System/Library/Frameworks/Security.framework/Security"
-SECURITY_SHIM = "/usr/lib/securityshim.dylib"  # theos does not add a lib prefix
+SECURITY_SHIM = os.environ.get("PREFIX", "") + "/usr/lib/securityshim.dylib"  # theos does not add a lib prefix
 
 def patch(path):
     with open(path, "r+b") as f:

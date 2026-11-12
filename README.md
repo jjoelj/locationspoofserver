@@ -14,7 +14,9 @@ The API below is plain HTTP, though, so anything that can make a request works.
 ## Requirements
 
 - A jailbroken iPhone. Developed against iOS 14.3 on a Taurine/libhooker
-  device; the Tailscale workarounds below are specific to that vintage.
+  device; the Tailscale workarounds below are specific to that vintage. A
+  rootless (`iphoneos-arm64`, e.g. Dopamine/palera1n) package is also built but
+  untested on device so far.
 - Root SSH to the phone, with key auth set up, if you build from source or want
   the optional SSH-over-tailnet setup — `ssh root@<phone>` with no password.
 - A [Tailscale](https://tailscale.com) account. Free tier is plenty; this is
@@ -35,6 +37,8 @@ The API below is plain HTTP, though, so anything that can make a request works.
 | `/usr/libexec/tsboot` | Starts tailscaled; launchd cannot spawn it directly (see below) |
 | `/usr/local/bin/tailscaled`, `/usr/local/bin/tailscale` | Tailscale, userspace mode, socket at `/var/run/lss-tailscaled.socket` |
 | `/usr/lib/securityshim.dylib` | Backfills one Security API that iOS 14 lacks (see below) |
+
+On a rootless jailbreak every path above except `/var/...` sits under `/var/jb`.
 
 Talking to our tailscaled from a shell needs the socket flag, since the default
 path belongs to the Tailscale iOS app if you have it installed:
@@ -67,7 +71,8 @@ THEOS_DEVICE_IP=iphone make package install
 ```
 
 Substitute your phone's hostname or IP. That cross-compiles Tailscale, builds
-the app and daemons, and installs the `.deb` over SSH.
+the app and daemons, and installs the `.deb` over SSH. For a rootless
+jailbreak, add `THEOS_PACKAGE_SCHEME=rootless`.
 
 </details>
 

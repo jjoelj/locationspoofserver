@@ -2,6 +2,8 @@ ARCHS = arm64
 
 TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = LocationSpoofServer
+# The install prefix is compiled in, so each scheme needs its own objects.
+THEOS_OBJ_DIR_NAME = obj/$(or $(THEOS_PACKAGE_SCHEME),rootful)$(_THEOS_OBJ_DIR_EXTENSION)
 
 include $(THEOS)/makefiles/common.mk
 
@@ -67,16 +69,14 @@ include $(THEOS_MAKE_PATH)/library.mk
 # relay box. Built from source on demand and dropped into the package; the 58MB
 # of binaries stay out of git. Needs `go` on PATH. See README.
 TAILSCALE_VERSION = v1.104.5
-TS_BIN = layout/usr/local/bin
-# Not /var/run/tailscaled.socket: that one belongs to the Tailscale iOS app.
-TS_SOCK = /var/run/lss-tailscaled.socket
-TS_CLI = /usr/local/bin/tailscale --socket=$(TS_SOCK)
+# Per scheme because the shim path is patched in.
+TS_BIN = .tailscale/$(TAILSCALE_VERSION)/$(or $(THEOS_PACKAGE_SCHEME),rootful)
 LDID ?= $(THEOS)/toolchain/linux/iphone/bin/ldid
 
-# before-stage, not before-package: staging copies layout/ into the package
-# tree, and it runs first. Built here, the binaries would land in layout/ after
-# the copy and ship in the *next* build instead of this one.
-before-stage:: $(TS_BIN)/tailscaled $(TS_BIN)/tailscale
+# Theos moves this under /var/jb itself for rootless.
+after-stage:: $(TS_BIN)/tailscaled $(TS_BIN)/tailscale
+	mkdir -p $(THEOS_STAGING_DIR)/usr/local/bin
+	cp $^ $(THEOS_STAGING_DIR)/usr/local/bin/
 
 $(TS_BIN)/%:
 	@command -v go >/dev/null || { echo "error: go not on PATH, needed to build $*"; exit 1; }
@@ -84,9 +84,26 @@ $(TS_BIN)/%:
 	# ("filesize is larger than vmsize") and the binary won't exec at all.
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go install -ldflags="-s -w" tailscale.com/cmd/$*@$(TAILSCALE_VERSION)
 	@mkdir -p $(TS_BIN)
+	@# ~80MB per version; keep only the current one.
+	find .tailscale -mindepth 1 -maxdepth 1 ! -name $(TAILSCALE_VERSION) -exec rm -rf {} +
 	cp "$$(go env GOPATH)/bin/darwin_arm64/$*" $@
-	python3 tools/ios_platform.py $@
+	PREFIX=$(THEOS_PACKAGE_INSTALL_PREFIX) python3 tools/ios_platform.py $@
 	$(LDID) -S $@
+
+# Rootless (THEOS_PACKAGE_SCHEME=rootless): prefix the paths in the staged
+# plists and scripts. Rootful copies stay untouched, since a rootful device can
+# have a stale /var/jb. Depending on DEBIAN/control runs this after staging.
+LSS_SCRIPTS = $(addprefix $(THEOS_STAGING_DIR)/DEBIAN/,postinst prerm postrm)
+ifneq ($(THEOS_PACKAGE_INSTALL_PREFIX),)
+before-package:: $(THEOS_STAGING_DIR)/DEBIAN/control
+	sed -i -e 's#\(/usr/libexec/\|/usr/local/bin/\|/Library/LaunchDaemons/\)#$(THEOS_PACKAGE_INSTALL_PREFIX)\1#g' \
+		$(LSS_SCRIPTS) $(THEOS_STAGING_DIR)/Library/LaunchDaemons/*.plist
+	sed -i -e '1s#^\#!/bin/bash#\#!$(THEOS_PACKAGE_INSTALL_PREFIX)/bin/sh#' \
+		-e '1a export PATH=$(THEOS_PACKAGE_INSTALL_PREFIX)/usr/bin:$(THEOS_PACKAGE_INSTALL_PREFIX)/bin:$(THEOS_PACKAGE_INSTALL_PREFIX)/usr/sbin:$(THEOS_PACKAGE_INSTALL_PREFIX)/sbin:$$PATH' \
+		$(LSS_SCRIPTS)
+	sed -i 's#^exit 0$$#uicache -p $(THEOS_PACKAGE_INSTALL_PREFIX)/Applications/LocationSpoofServer.app || true\nexit 0#' \
+		$(THEOS_STAGING_DIR)/DEBIAN/postinst
+endif
 
 # Daemon loading lives in layout/DEBIAN/postinst, so a Sileo install gets it
 # too; dpkg runs that for `make install` as well. Nothing to repeat here.

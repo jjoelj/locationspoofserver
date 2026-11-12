@@ -12,6 +12,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 static const int kFMFWatchPort = 8766;
 
@@ -207,13 +212,44 @@ static NSString *FMFWatchRequest(NSString *path, NSDictionary<NSString *, NSStri
     return [raw substringFromIndex:sep.location + sep.length];
 }
 
-static const char *kTSCLI = "/usr/local/bin/tailscale --socket=/var/run/lss-tailscaled.socket";
+#define kTSPath THEOS_PACKAGE_INSTALL_PREFIX "/usr/local/bin/tailscale"
+
+// Not popen: rootless has no /bin/sh.
+static FILE *SpawnTS(NSString *args, BOOL withStderr, pid_t *pid) {
+    NSMutableArray<NSString *> *a = [@[@kTSPath, @"--socket=/var/run/lss-tailscaled.socket"] mutableCopy];
+    [a addObjectsFromArray:[args componentsSeparatedByString:@" "]];
+    char *argv[a.count + 1];
+    for (NSUInteger i = 0; i < a.count; i++) argv[i] = (char *)a[i].UTF8String;
+    argv[a.count] = NULL;
+
+    int fds[2];
+    if (pipe(fds) != 0) return NULL;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    if (withStderr) posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+    else posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    int err = posix_spawn(pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (err != 0) { close(fds[0]); return NULL; }
+    return fdopen(fds[0], "r");
+}
+
+// Returns what pclose would.
+static int CloseTS(FILE *f, pid_t pid) {
+    fclose(f);
+    int status;
+    return waitpid(pid, &status, 0) < 0 ? -1 : status;
+}
 
 // Run a tailscale CLI command, logging every line it prints (stderr included --
 // that is where `up` puts the login URL) and handing each to `onLine`.
 static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
-    NSString *cmd = [NSString stringWithFormat:@"%s %@ 2>&1", kTSCLI, args];
-    FILE *p = popen(cmd.UTF8String, "r");
+    pid_t pid;
+    FILE *p = SpawnTS(args, YES, &pid);
     if (!p) return -1;
 
     char buf[1024];
@@ -223,7 +259,7 @@ static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
         [[LSSLogger shared] log:line tag:@"TAILSCALE"];
         if (onLine) onLine(line);
     }
-    return pclose(p);
+    return CloseTS(p, pid);
 }
 
 @interface LSSDaemonController ()
@@ -285,15 +321,15 @@ static int RunTS(NSString *args, void (^onLine)(NSString *line)) {
         if (self.cachedPublicURL) return self.cachedPublicURL;
     }
 
-    FILE *p = popen("/usr/local/bin/tailscale --socket=/var/run/lss-tailscaled.socket "
-                    "status --json 2>/dev/null", "r");
+    pid_t pid;
+    FILE *p = SpawnTS(@"status --json", NO, &pid);
     if (!p) return nil;
 
     NSMutableData *out = [NSMutableData data];
     char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), p)) > 0) [out appendBytes:buf length:n];
-    if (pclose(p) != 0 || out.length == 0) {
+    if (CloseTS(p, pid) != 0 || out.length == 0) {
         [[LSSLogger shared] log:@"tailscale status unavailable" tag:@"DAEMON"];
         return nil;
     }

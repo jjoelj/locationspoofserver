@@ -19,7 +19,7 @@ extern char **environ;
 
 int main(void) {
     char *argv[] = {
-        "/usr/local/bin/tailscaled",
+        THEOS_PACKAGE_INSTALL_PREFIX "/usr/local/bin/tailscaled",
         "--tun=userspace-networking",
         "--statedir=/var/lib/tailscale",
         "--socket=/var/run/lss-tailscaled.socket",
