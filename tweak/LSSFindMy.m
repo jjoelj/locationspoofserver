@@ -18,6 +18,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <Block.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <notify.h>
@@ -186,13 +187,15 @@ static void SnapshotSoon(void) {
 static void StayAwake(void) {
     UIApplication *app = UIApplication.sharedApplication;
     if (!app || app.applicationState == UIApplicationStateActive) return;
-    __block UIBackgroundTaskIdentifier bg = [app beginBackgroundTaskWithExpirationHandler:^{
-        [app endBackgroundTask:bg];
-        bg = UIBackgroundTaskInvalid;
-    }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    __block UIBackgroundTaskIdentifier bg = UIBackgroundTaskInvalid;
+    // Heap-copied before UIKit sees it: LLVM 19 leaves a stack block's isa
+    // unsigned and iOS 18's objc_msgSend rejects it. C APIs copy blocks
+    // themselves; only capturing blocks handed to Obj-C need this.
+    void (^end)(void) = (__bridge_transfer void (^)(void))_Block_copy((__bridge const void *)^{
         if (bg != UIBackgroundTaskInvalid) { [app endBackgroundTask:bg]; bg = UIBackgroundTaskInvalid; }
     });
+    bg = [app beginBackgroundTaskWithExpirationHandler:end];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC), dispatch_get_main_queue(), end);
 }
 
 __attribute__((constructor)) static void LSSFindMyInit(void) {
