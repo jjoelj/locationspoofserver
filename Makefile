@@ -1,4 +1,6 @@
-ARCHS = arm64 arm64e
+# arm64e only for the tweak: LLVM 19's arm64e Obj-C classes trap at launch on
+# iOS 18 (class_ro pointer auth). The tweak defines no classes.
+ARCHS = arm64
 # LLVM 19 (L1ghtmann v19.0.0-L2): the LSSFindMy tweak loads into Messages, an
 # arm64e process, and iOS 14+ only loads new-ABI arm64e. Theos's default
 # clang 13 emits the old ABI.
@@ -73,6 +75,7 @@ include $(THEOS_MAKE_PATH)/library.mk
 # to fmfwatchd. See tweak/LSSFindMy.m for why it lives in Messages.
 TWEAK_NAME = LSSFindMy
 LSSFindMy_FILES = tweak/LSSFindMy.m
+LSSFindMy_ARCHS = arm64 arm64e
 LSSFindMy_CFLAGS = -fobjc-arc
 LSSFindMy_FRAMEWORKS = Foundation CoreLocation UIKit
 
