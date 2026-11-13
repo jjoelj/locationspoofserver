@@ -174,6 +174,7 @@ static NSUInteger Ingest(NSData *body) {
     NSUInteger stored = 0;
     for (NSDictionary *r in rows) {
         if (![r isKindOfClass:NSDictionary.class]) continue;
+        if ([r[@"note"] isKindOfClass:NSString.class]) Log([@"watch tweak: " stringByAppendingString:r[@"note"]]);
         NSString *hid = r[@"h"];
         double ts = [r[@"ts"] doubleValue];
         if (![hid isKindOfClass:NSString.class] || !hid.length || ts <= 0) continue;

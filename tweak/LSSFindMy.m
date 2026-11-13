@@ -143,11 +143,25 @@ static void SendSnapshot(void) {
     // iOS 17+: IMCore picks FindMyLocate or FMF behind these selectors.
     if ([s respondsToSelector:NSSelectorFromString(@"findMyHandlesSharingLocationWithMe")]) {
         NSMutableArray *rows = [NSMutableArray array];
-        for (id h in Coll(Send(s, @"findMyHandlesSharingLocationWithMe"))) {
-            NSDictionary *r = Row(Send(h, @"identifier"), Send1(s, @"findMyLocationForFindMyHandle:", h));
+        NSArray *handles = Coll(Send(s, @"findMyHandlesSharingLocationWithMe"));
+        NSString *why = nil;
+        for (id h in handles) {
+            id loc = Send1(s, @"findMyLocationForFindMyHandle:", h);
+            NSDictionary *r = Row(Send(h, @"identifier"), loc);
             if (r) [rows addObject:r];
+            else if (!why) {
+                id fml = Send(loc, @"fmlLocation");
+                why = [NSString stringWithFormat:@"no fix: handle=%@ loc=%@ fml=%@ lat=%f ts=%f",
+                       [h class], loc ? [loc class] : nil, fml ? [fml class] : nil,
+                       SendD(fml, @"latitude"), SendD(fml, @"timestamp")];
+            }
         }
-        if (rows.count) Post(rows);
+        // Says why nothing came back, in fmfwatchd's log.
+        if (!rows.count) {
+            why = [NSString stringWithFormat:@"%lu handles, 0 rows; %@", (unsigned long)handles.count, why ?: @""];
+            [rows addObject:@{@"note": why}];
+        }
+        Post(rows);
         return;
     }
 
