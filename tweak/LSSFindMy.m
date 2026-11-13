@@ -189,7 +189,7 @@ static void SendSnapshot(void) {
 // start it on Messages' own FindMyLocateSession (as BlueBubbles does). Results
 // arrive through the location notifications below.
 static void SnapshotSoon(void);
-static void RefreshInMessages(void) {
+static void RefreshInMessages(int tries) {
     id s = Session();
     id fml = Send(s, @"fmlSession");
     Class hc = objc_getClass("FMLHandle");
@@ -199,6 +199,12 @@ static void RefreshInMessages(void) {
     for (id h in Coll(Send(s, @"findMyHandlesSharingLocationWithMe"))) {
         id fh = Send1((id)hc, @"handleWithIdentifier:", Send(h, @"identifier"));
         if (fh) [handles addObject:fh];
+    }
+    // Just after a background launch Messages hasn't loaded its friends yet;
+    // retry each second, well inside StayAwake's window.
+    if (!handles.count && tries > 1) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ RefreshInMessages(tries - 1); });
+        return;
     }
     Post(@[@{@"note": [NSString stringWithFormat:@"refreshing %lu in Messages", (unsigned long)handles.count]}]);
     if (!handles.count) return;
@@ -251,7 +257,7 @@ __attribute__((constructor)) static void LSSFindMyInit(void) {
         StayAwake();
         Post(@[]);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            RefreshInMessages();
+            RefreshInMessages(15);
             SendSnapshot();
         });
     }];
@@ -262,7 +268,7 @@ __attribute__((constructor)) static void LSSFindMyInit(void) {
     notify_register_dispatch("io.github.jjoelj.lss.fmf-ping", &token, dispatch_get_main_queue(), ^(int t) {
         StayAwake();
         Post(@[]);
-        RefreshInMessages();
+        RefreshInMessages(15);
         SendSnapshot();
     });
 }
