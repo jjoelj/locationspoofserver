@@ -81,6 +81,10 @@ LSSFindMy_FRAMEWORKS = Foundation CoreLocation UIKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
+# LLVM 19 leaves Obj-C isa pointers unsigned; iOS 18 Messages crashes on them.
+before-package::
+	find $(THEOS_STAGING_DIR) -name LSSFindMy.dylib -exec python3 tools/sign_isa.py {} \; -exec $(TARGET_CODESIGN) -S {} \;
+
 # Tailscale, so the phone can expose itself over Funnel without an SSH-forward
 # relay box. Built from source on demand and dropped into the package; the 58MB
 # of binaries stay out of git. Needs `go` on PATH. See README.
