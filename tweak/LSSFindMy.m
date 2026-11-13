@@ -185,6 +185,30 @@ static void SendSnapshot(void) {
     @try { ((void (*)(id, SEL, id, id))objc_msgSend)(fmf, get, nil, done); } @catch (NSException *e) {}
 }
 
+// iOS 17+: a locate started by fmfwatchd never reaches Messages' session, so
+// start it on Messages' own FindMyLocateSession (as BlueBubbles does). Results
+// arrive through the location notifications below.
+static void SnapshotSoon(void);
+static void RefreshInMessages(void) {
+    id s = Session();
+    id fml = Send(s, @"fmlSession");
+    Class hc = objc_getClass("FMLHandle");
+    SEL sel = NSSelectorFromString(@"startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:");
+    if (![fml respondsToSelector:sel] || !hc) return;
+    NSMutableArray *handles = [NSMutableArray array];
+    for (id h in Coll(Send(s, @"findMyHandlesSharingLocationWithMe"))) {
+        id fh = Send1((id)hc, @"handleWithIdentifier:", Send(h, @"identifier"));
+        if (fh) [handles addObject:fh];
+    }
+    Post(@[@{@"note": [NSString stringWithFormat:@"refreshing %lu in Messages", (unsigned long)handles.count]}]);
+    if (!handles.count) return;
+    @try {
+        ((void (*)(id, SEL, id, long long, BOOL, BOOL, id))objc_msgSend)(fml, sel, handles, 1000, NO, YES, ^{
+            dispatch_async(dispatch_get_main_queue(), ^{ SnapshotSoon(); });
+        });
+    } @catch (NSException *e) {}
+}
+
 // Locations arrive in bursts, one notification per friend; batch them.
 static void SnapshotSoon(void) {
     static BOOL pending;
@@ -226,7 +250,10 @@ __attribute__((constructor)) static void LSSFindMyInit(void) {
                                                      queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         StayAwake();
         Post(@[]);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ SendSnapshot(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            RefreshInMessages();
+            SendSnapshot();
+        });
     }];
 
     // fmfwatchd's "are you there?" before a refresh. A suspended Messages never
@@ -235,6 +262,7 @@ __attribute__((constructor)) static void LSSFindMyInit(void) {
     notify_register_dispatch("io.github.jjoelj.lss.fmf-ping", &token, dispatch_get_main_queue(), ^(int t) {
         StayAwake();
         Post(@[]);
+        RefreshInMessages();
         SendSnapshot();
     });
 }
